@@ -6,10 +6,11 @@ Newest entries first within each section.
 
 ```
 kernel:                   7.0.0-38-generic
-cpu:                      16 threads
+cpu:                      AMD Ryzen 7 7735HS with Radeon Graphics (16 threads)
 vm.max_map_count:         1048576
 unprivileged_userfaultfd: 0
-rustc:                    1.94.1
+shmem THP:                never
+rustc:                    1.94.1 (e408947bf 2026-03-25)
 wasmtime:                 47.0.4
 
 [ok  ] memfd_create: created a sparse 4 GiB memfd
@@ -25,6 +26,32 @@ Consequences:
 - The untouched page in the probe shows up as present + file because of fault-around. That's harmless, since only present-and-not-file pages count as dirty.
 
 ## Decisions and findings
+
+### 2026-10-11 — S1 fork is ~225 µs, not < 50 µs: where the time goes (proposals for Week 2)
+This is a temporary per-phase instrumentation of `Sandbox::snapshot` (since reverted). The setup is 64 MiB of memory, 128 dirty pages (one run), and `PAGEMAP_SCAN`:
+
+| phase | time |
+|---|---|
+| dirty scan (`PAGEMAP_SCAN`) | ~14 µs |
+| capture: `memfd_create` + `ftruncate` | ~4 µs |
+| capture: allocate 128 shmem pages | ~130 µs (≈1 µs/page; measured with `fallocate` alone) |
+| capture: copy 512 KiB | ~40 µs |
+| parent remap over the new layer (`mmap MAP_FIXED`, frees 128 anon pages) | ~37 µs |
+| spawn (instantiate + compose 1–2 layers + restore globals) | ~31 µs |
+
+So the critical path is dominated by **shmem page allocation**, not by scanning or copying. Two proposals:
+
+1. **Pre-allocated, packed layer pool.**
+   - Store a layer's pages packed (file offset ≠ memory offset; `mmap` allows this) in memfds that were `fallocate`d ahead of time.
+   - Refill the pool off the fork path, for example between calls or on a helper thread.
+   - Use one `pwritev` per snapshot.
+   - Expected effect: removes the ~130 µs allocation from the fork.
+2. **Async write-protect dirty tracking instead of the parent remap.**
+   - Register the memory with userfaultfd using `UFFD_FEATURE_WP_ASYNC` (kernel ≥ 6.7; works with `UFFD_USER_MODE_ONLY`).
+   - Scan with `PAGEMAP_SCAN` + `PM_SCAN_WP_MATCHING`, which reports *written since last scan* and re-protects atomically.
+   - The parent then keeps its private pages, and the ~37 µs remap disappears. The cost is that the parent holds a private copy of the pages it dirtied (O(dirty)).
+
+S0 is 78 ms per fork, so S1 is already ~350× faster. The < 50 µs target is not met yet.
 
 ### 2026-10-11 — Wasmtime pinned to 47.0.4
 Wasmtime 48/49 need rustc ≥ 1.95/1.96, and the installed toolchain is 1.94.1. 47.0.4 has the same `MemoryCreator`/`LinearMemory` API. Upgrading means `rustup update` plus a version bump.
@@ -75,4 +102,20 @@ Integration tests and criterion benches live in `crates/forkasm/{tests,benches}`
 
 ## Benchmarks
 
-_None yet._
+### 2026-10-11 — Week 1: fork latency, S0 vs S1, 64 MiB, 128 dirty pages (0.78%)
+- Machine: AMD Ryzen 7 7735HS (16 threads), kernel 7.0.0-38-generic, Wasmtime 47.0.4, rustc 1.94.1, release build.
+- Guest: G1 (`guests/kv`) with its 63 MiB page buffer fully touched, then snapshotted. Every iteration spawns a parent from that clean snapshot and dirties 128 contiguous pages. Then it times `snapshot()` + one `spawn_from()`.
+- "fork" = snapshot + spawn.
+
+`forkasm-cli bench-fork guests/kv/target/wasm32-wasip1/release/kv.wasm 1000` (median / p99, 1000 iterations; S0 100):
+
+| strategy | snapshot | spawn | fork |
+|---|---|---|---|
+| S0 (full copy) | 47.33 ms / 51.62 ms | 31.38 ms / 34.36 ms | 78.83 ms / 84.65 ms |
+| S1, `/proc/self/pagemap` read | 245.0 µs / 352.6 µs | 31.3 µs / 49.5 µs | 277.1 µs / 392.2 µs |
+| S1, `PAGEMAP_SCAN` | 192.3 µs / 264.9 µs | 30.5 µs / 53.7 µs | **223.6 µs / 300.0 µs** |
+
+`cargo bench -p forkasm --bench fork` (criterion medians; they agree with the table above):
+- `snapshot+spawn`: S0 78.5 ms, S1-pagemap 282.0 µs, S1-pagemap_scan 231.0 µs
+- `snapshot`: S0 47.5 ms, S1-pagemap 251.2 µs, S1-pagemap_scan 199.8 µs
+- `spawn` from a fixed snapshot: S0 36.2 ms, S1 31.9–32.1 µs

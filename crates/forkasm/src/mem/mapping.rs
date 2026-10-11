@@ -194,9 +194,9 @@ impl MemHandle {
     }
 
     /// Copies the accessible memory out.
-    pub(crate) fn read_all(&self) -> Vec<u8> {
+    pub(crate) fn read_all<B: for<'a> From<&'a [u8]>>(&self) -> B {
         // SAFETY: the sandbox is quiescent (type-level contract above).
-        unsafe { self.0.bytes(0, self.len()) }.to_vec()
+        B::from(unsafe { self.0.bytes(0, self.len()) })
     }
 
     /// Copies `data` into memory at `off`.

@@ -116,7 +116,7 @@ impl Sandbox {
         }
         let globals = self.globals.iter().map(|g| g.get(&mut self.store)).collect();
         let mem = match &self.base {
-            MemSnap::Copy(_) => MemSnap::Copy(self.mem.read_all().into()),
+            MemSnap::Copy(_) => MemSnap::Copy(self.mem.read_all()),
             MemSnap::Layered(stack) => {
                 let runs = self.mem.dirty_runs(self.module.0.dirty_scan)?;
                 let size = self.mem.len();
