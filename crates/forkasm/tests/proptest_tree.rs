@@ -2,8 +2,9 @@
 //! spawn, drop, compact} across a sandbox tree, run under S0 and an S1
 //! variant side by side; every touched sandbox must stay identical.
 //!
-//! `PROPTEST_CASES=10000 cargo test --release -p forkasm --test proptest_tree`
+//! `FORKASM_PROPTEST_CASES=10000 cargo test --release -p forkasm --test proptest_tree`
 //! is the Week 2 bar; plain `cargo test` runs a smaller number of cases.
+//! (Not `PROPTEST_CASES`: proptest applies that to every shard.)
 
 mod common;
 
@@ -24,6 +25,9 @@ enum Op {
     Work(Index, u16),
     /// Host write into the guest's scratch area.
     Write(Index, usize, u8),
+    /// Guest file operation through `std::fs`: append to, or remove, one of a
+    /// few files.
+    File(Index, u8, u16),
     Snapshot(Index),
     SnapshotCompacted(Index),
     Spawn(Index, u8),
@@ -37,6 +41,7 @@ fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         4 => (any::<Index>(), any::<u16>()).prop_map(|(s, seed)| Op::Work(s, seed)),
         2 => (any::<Index>(), 0..SCRATCH_PAGES * 4096, any::<u8>()).prop_map(|(s, o, v)| Op::Write(s, o, v)),
+        2 => (any::<Index>(), any::<u8>(), any::<u16>()).prop_map(|(s, f, seed)| Op::File(s, f, seed)),
         2 => any::<Index>().prop_map(Op::Snapshot),
         1 => any::<Index>().prop_map(Op::SnapshotCompacted),
         3 => (any::<Index>(), any::<u8>()).prop_map(|(s, b)| Op::Spawn(s, b)),
@@ -44,6 +49,24 @@ fn op() -> impl Strategy<Value = Op> {
         1 => any::<Index>().prop_map(Op::DropSandbox),
         1 => any::<Index>().prop_map(Op::DropSnapshot),
     ]
+}
+
+/// Appends `seed`-derived bytes to `path`, or (1 in 5) removes it.
+fn file_op(sb: &mut Sandbox, path: &str, seed: u16) {
+    let data: Vec<u8> = (0..seed % 300).map(|i| (i ^ seed) as u8).collect();
+    let mut arg = |bytes: &[u8]| {
+        let ptr = sb.call_u64("alloc", &[Val::I32(bytes.len().max(1) as i32)]).unwrap();
+        sb.write_memory(ptr as usize, bytes).unwrap();
+        [Val::I32(ptr as i32), Val::I32(bytes.len() as i32)]
+    };
+    let p = arg(path.as_bytes());
+    if seed.is_multiple_of(5) {
+        sb.call("fs_remove", &p).unwrap();
+    } else {
+        let d = arg(&data);
+        let rc = sb.call_u64("append_file", &[p[0], p[1], d[0], d[1]]).unwrap();
+        assert_eq!(rc, 0);
+    }
 }
 
 /// A runtime and the loaded guest, shared by all cases.
@@ -131,6 +154,14 @@ impl<'a> Tree<'a> {
                 }
                 self.check(i, "write");
             }
+            Op::File(ref s, file, seed) => {
+                let i = s.index(n);
+                let path = format!("/f{}", file % 4);
+                for sb in &mut self.sandboxes[i] {
+                    file_op(sb, &path, seed);
+                }
+                self.check(i, "file");
+            }
             Op::Snapshot(ref s) | Op::SnapshotCompacted(ref s) => {
                 let i = s.index(n);
                 let snap = self.snapshot(i, matches!(op, Op::SnapshotCompacted(_)));
@@ -195,12 +226,12 @@ fn run(variant: Index, ops: Vec<Op>) {
     }
 }
 
-/// Cases per shard: the total (`PROPTEST_CASES`, default 256 in release, 24
-/// in debug) split across the shards below, which the test harness runs in
-/// parallel.
+/// Cases per shard: the total (`FORKASM_PROPTEST_CASES`, default 256 in
+/// release, 24 in debug) split across the shards below, which the test
+/// harness runs in parallel.
 fn config() -> ProptestConfig {
     const SHARDS: u32 = 8;
-    let total = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok());
+    let total = std::env::var("FORKASM_PROPTEST_CASES").ok().and_then(|c| c.parse().ok());
     let total: u32 = total.unwrap_or(if cfg!(debug_assertions) { 24 } else { 256 });
     ProptestConfig { cases: total.div_ceil(SHARDS), ..ProptestConfig::default() }
 }

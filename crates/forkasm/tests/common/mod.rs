@@ -81,6 +81,8 @@ pub fn assert_same(s0: &mut Sandbox, s1: &mut Sandbox, what: &str) {
     assert_eq!(s0.stdout(), s1.stdout(), "{what}: stdout");
     assert_eq!(s0.wasi().rng, s1.wasi().rng, "{what}: rng");
     assert_eq!(s0.wasi().clock.now_ns, s1.wasi().clock.now_ns, "{what}: clock");
+    assert!(s0.wasi().vfs.walk() == s1.wasi().vfs.walk(), "{what}: filesystems differ");
+    assert_eq!(s0.stats().open_fds, s1.stats().open_fds, "{what}: open fds");
 }
 
 /// Applies a deterministic batch of guest operations derived from `seed` to a

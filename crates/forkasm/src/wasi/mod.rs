@@ -1,9 +1,11 @@
 //! Our own `wasi_snapshot_preview1` (SPEC §5.4).
 //!
 //! All sandbox-visible state lives in [`WasiState`], which is plain data and
-//! cloned on fork. Clock and RNG are deterministic unless real time is asked
-//! for. Calls we don't implement return `ENOSYS` and are logged once.
+//! cloned on fork: the filesystem ([`Vfs`]) and fd table included. Clock and
+//! RNG are deterministic unless real time is asked for. Calls we don't
+//! implement return `ENOSYS` and are logged once.
 
+mod fs;
 mod rng;
 
 use std::collections::HashSet;
@@ -12,7 +14,10 @@ use std::time::{Instant, SystemTime};
 
 use wasmtime::{Caller, Extern, Linker, Module, Val, ValType};
 
+pub use fs::FdTable;
 pub use rng::Rng;
+
+use crate::vfs::Vfs;
 
 pub(crate) const MODULE: &str = "wasi_snapshot_preview1";
 
@@ -20,9 +25,17 @@ pub(crate) const MODULE: &str = "wasi_snapshot_preview1";
 mod errno {
     pub const SUCCESS: i32 = 0;
     pub const BADF: i32 = 8;
+    pub const EXIST: i32 = 20;
     pub const FAULT: i32 = 21;
     pub const INVAL: i32 = 28;
+    pub const ISDIR: i32 = 31;
+    pub const NOENT: i32 = 44;
     pub const NOSYS: i32 = 52;
+    pub const NOTDIR: i32 = 54;
+    pub const NOTEMPTY: i32 = 55;
+    pub const ROFS: i32 = 69;
+    pub const SPIPE: i32 = 70;
+    pub const NOTCAPABLE: i32 = 76;
 }
 
 /// The guest called `proc_exit`.
@@ -62,6 +75,15 @@ impl Clock {
         self.now_ns += self.tick_ns;
         if realtime { EPOCH_NS + self.now_ns } else { self.now_ns }
     }
+
+    /// Current realtime without advancing virtual time (file timestamps).
+    pub(crate) fn peek_realtime(&self) -> u64 {
+        if self.real {
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+            return now.unwrap_or_default().as_nanos() as u64;
+        }
+        EPOCH_NS + self.now_ns
+    }
 }
 
 /// Everything a guest can observe through WASI. Cloned on fork.
@@ -74,6 +96,8 @@ pub struct WasiState {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit: Option<i32>,
+    pub vfs: Vfs,
+    pub fds: FdTable,
 }
 
 const IMPLEMENTED: &[&str] = &[
@@ -83,12 +107,8 @@ const IMPLEMENTED: &[&str] = &[
     "environ_get",
     "clock_time_get",
     "random_get",
-    "fd_write",
-    "fd_fdstat_get",
-    "fd_prestat_get",
-    "fd_prestat_dir_name",
-    "fd_close",
     "proc_exit",
+    "sched_yield",
 ];
 
 /// Adds our preview1 functions, plus an `ENOSYS` stub for every other
@@ -137,53 +157,8 @@ pub(crate) fn add_to_linker(linker: &mut Linker<WasiState>, module: &Module) -> 
             Ok(errno::SUCCESS)
         })
     })?;
-    linker.func_wrap(
-        MODULE,
-        "fd_write",
-        |mut c: Caller<'_, WasiState>, fd: i32, iovs: i32, n_iovs: i32, out: i32| {
-            with_mem(&mut c, |m, s| {
-                let sink = match fd {
-                    1 => &mut s.stdout,
-                    2 => &mut s.stderr,
-                    _ => return Ok(errno::BADF),
-                };
-                let mut written = 0u32;
-                for i in 0..n_iovs as u32 {
-                    let iov = iovs.wrapping_add((i * 8) as i32);
-                    let (ptr, len) = (m.read_u32(iov)?, m.read_u32(iov.wrapping_add(4))?);
-                    sink.extend_from_slice(m.slice_mut(ptr as i32, len)?);
-                    written += len;
-                }
-                m.write_u32(out, written)
-            })
-        },
-    )?;
-    linker.func_wrap(MODULE, "fd_fdstat_get", |mut c: Caller<'_, WasiState>, fd: i32, out: i32| {
-        if !(0..=2).contains(&fd) {
-            return Ok(errno::BADF);
-        }
-        with_mem(&mut c, |m, _| {
-            let stat = m.slice_mut(out, 24)?;
-            stat.fill(0);
-            stat[0] = 2; // filetype: character device
-            // rights: fd_read (bit 1) for stdin, fd_write (bit 6) for stdout/stderr.
-            let rights: u64 = if fd == 0 { 1 << 1 } else { 1 << 6 };
-            stat[8..16].copy_from_slice(&rights.to_le_bytes());
-            Ok(errno::SUCCESS)
-        })
-    })?;
-    // No preopened directories until the VFS lands (Week 2).
-    linker.func_wrap(MODULE, "fd_prestat_get", |_: Caller<'_, WasiState>, _fd: i32, _out: i32| {
-        Ok(errno::BADF)
-    })?;
-    linker.func_wrap(
-        MODULE,
-        "fd_prestat_dir_name",
-        |_: Caller<'_, WasiState>, _fd: i32, _p: i32, _l: i32| Ok(errno::BADF),
-    )?;
-    linker.func_wrap(MODULE, "fd_close", |_: Caller<'_, WasiState>, fd: i32| {
-        Ok(if (0..=2).contains(&fd) { errno::SUCCESS } else { errno::BADF })
-    })?;
+    linker.func_wrap(MODULE, "sched_yield", |_: Caller<'_, WasiState>| Ok(errno::SUCCESS))?;
+    fs::add_to_linker(linker)?;
     linker.func_wrap(
         MODULE,
         "proc_exit",
@@ -194,7 +169,10 @@ pub(crate) fn add_to_linker(linker: &mut Linker<WasiState>, module: &Module) -> 
     )?;
 
     for import in module.imports() {
-        if import.module() != MODULE || IMPLEMENTED.contains(&import.name()) {
+        if import.module() != MODULE
+            || IMPLEMENTED.contains(&import.name())
+            || fs::IMPLEMENTED.contains(&import.name())
+        {
             continue;
         }
         let Some(ty) = import.ty().func().cloned() else { continue };
@@ -241,6 +219,30 @@ impl GuestMem<'_> {
     fn write_u32(&mut self, ptr: i32, v: u32) -> Result<Errno, Errno> {
         self.slice_mut(ptr, 4)?.copy_from_slice(&v.to_le_bytes());
         Ok(errno::SUCCESS)
+    }
+
+    /// The `(ptr, len)` pairs of an iovec array.
+    fn iovecs(&mut self, iovs: i32, n: i32) -> Result<Vec<(u32, u32)>, Errno> {
+        (0..n as u32)
+            .map(|i| {
+                let iov = iovs.wrapping_add((i * 8) as i32);
+                Ok((self.read_u32(iov)?, self.read_u32(iov.wrapping_add(4))?))
+            })
+            .collect()
+    }
+
+    /// The bytes an iovec array points to, concatenated.
+    fn gather(&mut self, iovs: i32, n: i32) -> Result<Vec<u8>, Errno> {
+        let mut data = Vec::new();
+        for (ptr, len) in self.iovecs(iovs, n)? {
+            data.extend_from_slice(self.slice_mut(ptr as i32, len)?);
+        }
+        Ok(data)
+    }
+
+    fn read_str(&mut self, ptr: i32, len: i32) -> Result<String, Errno> {
+        let bytes = self.slice_mut(ptr, len as u32)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| errno::INVAL)
     }
 
     fn write_u64(&mut self, ptr: i32, v: u64) -> Result<Errno, Errno> {

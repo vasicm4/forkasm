@@ -34,8 +34,11 @@ fn root_runs_with_args_and_env() {
     for strategy in STRATEGIES {
         let rt = runtime(strategy);
         let module = rt.load(kv_wasm()).unwrap();
-        let opts =
-            SpawnOpts { args: vec!["kv".into(), "x".into()], env: vec![("A".into(), "1".into())], seed: 0 };
+        let opts = SpawnOpts {
+            args: vec!["kv".into(), "x".into()],
+            env: vec![("A".into(), "1".into())],
+            ..SpawnOpts::default()
+        };
         let mut root = rt.spawn(&module, opts).unwrap();
         root.call("init", &[]).unwrap();
         assert_eq!(String::from_utf8_lossy(root.stdout()), "kv: ready (args=2, env=1)\n");
@@ -135,21 +138,6 @@ fn globals_isolation() {
         assert_eq!(root.call_u64("inc", &[]).unwrap(), 2);
         assert_eq!(rt.spawn_from(&snap, 0).unwrap().call_u64("inc", &[]).unwrap(), 2);
         assert_eq!(root.globals()[0].i64(), Some(2));
-    }
-}
-
-#[test]
-fn files_are_enosys_until_the_vfs() {
-    for strategy in STRATEGIES {
-        let (_rt, mut root) = kv(strategy);
-        let path = "/x";
-        let p = root.call_u64("alloc", &[Val::I32(path.len() as i32)]).unwrap();
-        root.write_memory(p as usize, path.as_bytes()).unwrap();
-        let rc = root
-            .call_u64("write_file", &[Val::I32(p as i32), Val::I32(2), Val::I32(p as i32), Val::I32(2)])
-            .unwrap();
-        assert_ne!(rc, 0);
-        assert_eq!(get(&mut root, 1), u64::MAX, "sandbox still usable");
     }
 }
 

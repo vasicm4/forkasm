@@ -14,6 +14,7 @@ pub mod rewrite;
 mod runtime;
 mod sandbox;
 mod snapshot;
+pub mod vfs;
 pub mod wasi;
 
 pub use runtime::{Compaction, Config, GuestModule, Runtime, SpawnOpts, Strategy};

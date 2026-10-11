@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use forkasm::mem::DirtyTracking;
-use forkasm::{Config, Runtime, Sandbox, Snapshot, SpawnOpts, Strategy, Val};
+use forkasm::{Compaction, Config, Runtime, Sandbox, Snapshot, SpawnOpts, Strategy, Val};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -13,7 +13,12 @@ fn main() -> Result<()> {
         ["rewrite", path] => inspect(path),
         ["bench-fork", path] => bench_fork(path, 1000),
         ["bench-fork", path, iters] => bench_fork(path, iters.parse().context("iterations")?),
-        _ => bail!("usage: forkasm-cli envcheck | rewrite <module.wasm> | bench-fork <kv.wasm> [iterations]"),
+        ["bench-depth", path] => bench_depth(path, 256),
+        ["bench-depth", path, steps] => bench_depth(path, steps.parse().context("steps")?),
+        _ => bail!(
+            "usage: forkasm-cli envcheck | rewrite <module.wasm> | bench-fork <kv.wasm> [iterations] \
+             | bench-depth <kv.wasm> [steps]"
+        ),
     }
 }
 
@@ -100,6 +105,67 @@ fn bench_fork(path: &str, iters: usize) -> Result<()> {
             stats(&mut spawn_t),
             stats(&mut fork_t),
             if notes.is_empty() { String::new() } else { format!("  ({})", notes.join(", ")) },
+        );
+    }
+    Ok(())
+}
+
+/// Compaction trade-off: a fork-of-fork chain of `steps` levels on ~64 MiB,
+/// each level dirtying 64 scattered pages, under several thresholds.
+fn bench_depth(path: &str, steps: usize) -> Result<()> {
+    const BUF_PAGES: i32 = (63 * MIB / 4096) as i32;
+    println!("fork-of-fork chain: kv guest, {steps} levels, 64 scattered dirty pages per level\n");
+    println!(
+        "{:<24} {:>22} {:>22} {:>14} {:>12}",
+        "compaction", "snapshot med / p99", "spawn med / p99", "compactions", "maps/child"
+    );
+    let settings: [(&str, Option<Compaction>); 6] = [
+        ("off", None),
+        ("layers<=8", Some(Compaction { max_layers: 8, max_runs: usize::MAX, gap_pages: 16 })),
+        ("layers<=32", Some(Compaction { max_layers: 32, max_runs: usize::MAX, gap_pages: 16 })),
+        ("layers<=128", Some(Compaction { max_layers: 128, max_runs: usize::MAX, gap_pages: 16 })),
+        ("maps<=1024", Some(Compaction { max_layers: usize::MAX, max_runs: 1024, gap_pages: 16 })),
+        ("default", Some(Compaction::default())),
+    ];
+    for (name, compaction) in settings {
+        let rt = Runtime::new(Config { compaction, ..Config::default() })?;
+        let module = rt.load(path)?;
+        let mut sb = rt.spawn(&module, SpawnOpts::default())?;
+        sb.call("init", &[])?;
+        sb.call("buf_init", &[Val::I32(BUF_PAGES)])?;
+        sb.call("touch_pages", &[Val::I32(0), Val::I32(BUF_PAGES), Val::I32(1)])?;
+        let base = sb.snapshot()?;
+        sb = rt.spawn_from(&base, 0)?;
+        rt.warm_up()?;
+        let (mut snap_t, mut spawn_t) = (Vec::new(), Vec::new());
+        let mut compactions = 0;
+        let mut x: u64 = 0x9e37_79b9;
+        for level in 0..steps {
+            for _ in 0..64 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let page = (x % BUF_PAGES as u64) as i32;
+                sb.call("touch_pages", &[Val::I32(page), Val::I32(1), Val::I32(level as i32)])?;
+            }
+            let layers_before = sb.stats().layers;
+            let t0 = Instant::now();
+            let s = sb.snapshot()?;
+            let t1 = Instant::now();
+            let child = rt.spawn_from(&s, level as u64)?;
+            let t2 = Instant::now();
+            if s.layers() <= 1 && layers_before >= 1 {
+                compactions += 1;
+            }
+            snap_t.push(t1 - t0);
+            spawn_t.push(t2 - t1);
+            sb = child;
+        }
+        println!(
+            "{name:<24} {:>22} {:>22} {compactions:>14} {:>12}",
+            stats(&mut snap_t),
+            stats(&mut spawn_t),
+            sb.stats().runs
         );
     }
     Ok(())

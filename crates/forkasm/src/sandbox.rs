@@ -36,6 +36,10 @@ pub struct SandboxStats {
     pub layers: usize,
     /// Layer segments its memory maps over the base image (≈ extra VMAs) (S1).
     pub runs: usize,
+    /// Files and directories in its filesystem.
+    pub inodes: usize,
+    /// Open file descriptors, including stdio and the preopened root.
+    pub open_fds: usize,
 }
 
 impl Sandbox {
@@ -226,6 +230,40 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Reads the whole file at absolute `path` in the sandbox's filesystem.
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let vfs = &self.store.data().vfs;
+        let ino = vfs.resolve(crate::vfs::ROOT, path).with_context(|| format!("reading {path}"))?;
+        let mut buf = vec![0; vfs.inode(ino)?.size() as usize];
+        vfs.read(ino, 0, &mut buf).with_context(|| format!("reading {path}"))?;
+        Ok(buf)
+    }
+
+    /// Creates or replaces the file at absolute `path` (its directory must
+    /// exist).
+    pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        let wasi = self.store.data_mut();
+        let now = wasi.clock.peek_realtime();
+        let vfs = &mut wasi.vfs;
+        let (dir, name) =
+            vfs.resolve_parent(crate::vfs::ROOT, path).with_context(|| format!("writing {path}"))?;
+        let ino = match vfs.lookup(dir, name)? {
+            Some(ino) => ino,
+            None => vfs.create_file(dir, name, now)?,
+        };
+        vfs.truncate(ino, 0, now)?;
+        vfs.write(ino, 0, data, now)?;
+        Ok(())
+    }
+
+    /// Creates the directory at absolute `path` and any missing parents.
+    pub fn create_dir_all(&mut self, path: &str) -> Result<()> {
+        let wasi = self.store.data_mut();
+        let now = wasi.clock.peek_realtime();
+        wasi.vfs.create_dir_all(path, now).with_context(|| format!("creating {path}"))?;
+        Ok(())
+    }
+
     /// Current values of the mutable globals, in global-index order.
     pub fn globals(&mut self) -> Vec<Val> {
         self.globals.iter().map(|g| g.get(&mut self.store)).collect()
@@ -236,6 +274,14 @@ impl Sandbox {
             MemSnap::Copy(_) => (0, 0),
             MemSnap::Layered(s) => (s.layers().len(), s.segments()),
         };
-        SandboxStats { memory_bytes: self.mem.len(), depth: self.depth, layers, runs }
+        let wasi = self.store.data();
+        SandboxStats {
+            memory_bytes: self.mem.len(),
+            depth: self.depth,
+            layers,
+            runs,
+            inodes: wasi.vfs.inode_count(),
+            open_fds: wasi.fds.len(),
+        }
     }
 }

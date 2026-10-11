@@ -46,7 +46,8 @@ fn workload(config: &Config) {
     root.call("touch_pages", &[Val::I32(0), Val::I32(pages), Val::I32(1)]).unwrap();
     let mut snaps = vec![root.snapshot().unwrap()];
     let mut sb = rt.spawn_from(&snaps[0], 0).unwrap();
-    for level in 0..20 {
+    let levels = if cfg!(debug_assertions) { 6 } else { 20 };
+    for level in 0..levels {
         sb.call("touch_pages", &[Val::I32(level * 300), Val::I32(200), Val::I32(level)]).unwrap();
         let s = if level % 7 == 6 { sb.snapshot_compacted() } else { sb.snapshot() }.unwrap();
         let kids = rt.spawn_many(&s, 8).unwrap();

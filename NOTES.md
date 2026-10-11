@@ -28,6 +28,57 @@ Consequences:
 
 ## Decisions and findings
 
+### 2026-10-11 — Week 2: VFS and WASI file calls
+- **`vfs/`** is a persistent CoW tree. Inodes live in an `imbl::OrdMap<Ino, Inode>`. Directories are `OrdMap<String, Ino>`. Files are `Vec<Option<Arc<[u8; 64 KiB]>>>`, with `None` for holes.
+- Cloning a `Vfs` is O(1). After a fork, writing one byte copies one chunk plus the B-tree path to its inode. `vfs::tests::fork_shares_until_written` checks the sharing.
+- **Deviation from SPEC §5.5:** the inode table sits between directories and files. The spec sketches directories holding nodes directly. The extra level of indirection gives POSIX semantics to open files: an fd refers to an inode, so it survives rename and unlink, and the inode is freed when the last fd closes. `filesystem::open_files_survive_forks_with_their_own_offsets` tests this.
+- **`imbl` instead of `im`.** `im` has had no release since 2022, and `imbl` is its maintained fork with the same API.
+- **`wasi/fs.rs`** implements the SPEC §5.4 list, plus `fd_pread/pwrite/tell/renumber/allocate`, `fd_filestat_set_size`, `path_remove_directory`, no-op sync/advise/set-times calls, and `path_readlink`, which returns `EINVAL` because there are no symlinks.
+  - fd 3 is the preopen `/`.
+  - The fd table (`FdTable`) lives in `WasiState`, so forks clone the offsets.
+  - The guest's `std::fs` calls are tested through new G1 exports: `append_file`, `file_hash`, `file_len`, `fs_mkdir`, `fs_remove`, `fs_rename`, `list_count`, `hold_open`, `held_read`, `held_hash`.
+- **Read-only host mounts:** `SpawnOpts::mounts` copies a host tree in at root spawn and marks it read-only, so writes return `EROFS`. Contents are `Arc`-shared by every fork.
+  - The copy is eager. For CPython's stdlib (Week 3) that's roughly 30 MB, read once per root.
+- **Limitations:**
+  - **Known cost:** captured stdout/stderr are plain `Vec<u8>`s in `WasiState`, copied by every snapshot. A guest that prints a lot makes forks O(output). Fix when it shows up (Week 3's CPython): chunked `Arc` segments, as in `FileData`.
+  - There are no symlinks, and host-mount symlinks are followed at copy time.
+  - Timestamps can't be set; mtime is virtual time at modification.
+  - `..` can't climb above the fd it is resolved against. This matches WASI capability rules: `/` is the root preopen.
+
+### 2026-10-11 — Week 2: compaction and mapping plans
+- **Compaction** (`Config::compaction`, `Sandbox::snapshot_compacted`) triggers at snapshot time when the new stack would exceed either threshold:
+  - `max_layers` layers, or
+  - `max_runs` mappings per spawn.
+
+  Every page any layer covers is then copied from the parent, which holds exactly the snapshot's contents at that moment, into one new layer. Holes of up to `gap_pages` pages are filled so runs merge. The parent recomposes onto the new layer, which drops its private pages, the old layers' VMAs, and the write-tracking state.
+- **Mapping plans (`LayerStack::plan`).** A spawn used to map every run of every layer, oldest first, so pages covered by several layers were mapped several times. Now each snapshot computes once, lazily, the non-overlapping set of segments, each from the newest layer holding it, with adjacent same-layer pieces merged. Spawns `mmap` once per segment.
+  - Spawn on a 64-layer chain: ~400 µs → ~170 µs.
+  - Compaction also keys off the real segment count.
+  - `layer::tests::random_stacks_match_brute_force` checks the painting against a per-page reference on 2000 random stacks.
+- **Pool:** one process-wide worker thread now serves every `LayerPool`. Previously each `Runtime` started its own thread, which cost a malloc arena each.
+- **S0 spawn** pre-faults with `MADV_POPULATE_WRITE` before copying: 2.3 ms → 0.66 ms for ~3–4 MiB. That makes S0 a fairer baseline, and the property tests faster.
+- **G1 links with a 64 KiB stack** (`guests/kv/.cargo/config.toml`) instead of Rust's default 1 MiB. S0 copies every page of memory on each fork.
+
+### 2026-10-11 — Week 2: compaction trade-off, and defaults tightened (proposal: tiered compaction)
+`forkasm-cli bench-depth` (see Benchmarks) shows the trade-off on an adversarial workload: 64 *random* pages per level, across a 63 MiB buffer, for 256 fork-of-fork levels.
+- **Without compaction**, a deep child needs ~14k mappings. Spawn costs 37 ms (~2.6 µs per `mmap`), and the snapshot scan is slow too (2.6 ms, walking ~14k VMAs).
+- **The old defaults (≤ 64 layers, ≤ 4,096 mappings)** still left 3,237 mappings per child, so 1,000 branches would exceed the VMA cap. New defaults: **≤ 32 layers, ≤ 512 mappings, gap 16**. Spawn median 0.86 ms, 131 mappings per child.
+- **Compaction is O(pages covered by any layer).** With scattered writes and gap filling, the flat layer soon covers the whole buffer, so each compaction is a ~64 MiB copy: ~68 ms, the p99 of every compacting configuration. It ran 51 times in 256 levels, a heavy amortized cost for this access pattern.
+- **Proposal:** tiered (LSM-style) compaction. Merge only the newest layers when they exceed the thresholds, and fold into older tiers geometrically, so each page is copied O(log n) times instead of on every full flatten. Leave the decision for Week 3, after seeing CPython's real dirty pattern: CPython's heap is likely far more clustered than this benchmark.
+
+### 2026-10-11 — Week 2: correctness suite
+- **Property tests** (`tests/proptest_tree.rs`) run random sequences of {guest work, host write, guest file op, snapshot, compacted snapshot, spawn, fork-of-fork chain of 1–40 levels, drop sandbox, drop snapshot}. Each sequence runs on a sandbox tree under S0 and one randomly chosen S1 variant, side by side. The S1 variants are each tracking mode, without a pool, and with tight compaction (`max_layers` 4, `max_runs` 24).
+  - After every step, the touched pair must match in memory, globals, stdout, RNG, clock, filesystem and fd count. At the end, a sample of snapshots is respawned and compared.
+  - The run is split into 8 shards that run in parallel.
+  - `FORKASM_PROPTEST_CASES=10000 cargo test --release -p forkasm --test proptest_tree`; plain `cargo test` runs 24 cases (debug) or 256 (release). Don't use `PROPTEST_CASES`: proptest applies it to *each* shard, which multiplies the total by 8.
+- **Result:** `FORKASM_PROPTEST_CASES=10000` passes all 10,000 cases in 993 s (release, 8 shards). 1,765 cases built trees deeper than 64 levels; the deepest reached 134. An earlier, accidentally 8× larger run had already passed 14,039 cases with no failure before it was stopped.
+- **Leak test** (`tests/leaks.rs`, its own binary): busy trees under every strategy and variant, then drop everything. Result: memfds return to 0, VMAs return exactly to baseline, and `RssShmem` returns to 0.
+  - `RssAnon` creeps by ~0.2 MB per *runtime* created and levels off around 28 MB. Creating and dropping 1,600 sandboxes and snapshots on one runtime is flat.
+  - The creep therefore comes from Wasmtime engine and compile allocations plus allocator arenas, not forkasm. The test allows 32 MiB of anon slack.
+- **VMA-limit test** (`tests/limits.rs`, its own binary). Exhausting `vm.max_map_count` makes *every* `mmap` in the process fail (allocator, Wasmtime), and those abort instead of erroring. So the uncompacted case is measured and extrapolated:
+  - A snapshot whose 4096 dirty pages alternate costs 8,199 VMAs per uncompacted child, so 192 children would need 1.57 M against the 1,048,576 cap.
+  - With compaction (`max_runs` 1024), the same 192 children use 4 VMAs each and have byte-identical memory.
+
 ### 2026-10-11 — Implemented both fork-latency proposals: 224 µs → 95 µs median fork
 Both proposals from the entry below are now in (`mem/pool.rs`, `mem/uffd.rs`). Default config = `DirtyTracking::Auto` (→ `WriteProtect` when available) + `layer_pool: Some(16 MiB × 2)`. Snapshot breakdown with both: scan ~19 µs, `memcpy` of 512 KiB ~40 µs. Spawn ~33–37 µs is now the other half of the fork, and the next target.
 
@@ -123,8 +174,26 @@ Integration tests and criterion benches live in `crates/forkasm/{tests,benches}`
 | `anyhow`, `thiserror` | Error handling |
 | `wat` (dev) | Inline test modules |
 | `criterion` (dev) | Micro-benchmarks (SPEC §8) |
+| `imbl` | Persistent maps for the VFS (SPEC §5.5's `im::OrdMap`; `imbl` is the maintained fork) |
+| `proptest` (dev) | Property tests against S0 (SPEC §7) |
 
 ## Benchmarks
+
+### 2026-10-11 — Week 2: compaction trade-off (`forkasm-cli bench-depth … 256`)
+Same machine as below. A fork-of-fork chain of 256 levels on 64.1 MiB of memory. Each level dirties 64 random pages, snapshots, and continues in a new child. Default S1 (write-protect + pool). Median / p99:
+
+| compaction | snapshot | spawn | compactions | maps per child at the end |
+|---|---|---|---|---|
+| off | 2.61 ms / 4.15 ms | 36.83 ms / 52.84 ms | 0 | 14,023 |
+| layers ≤ 8 | 230.5 µs / 68.08 ms | 1.58 ms / 2.88 ms | 32 | 1 |
+| layers ≤ 32 | 504.4 µs / 72.03 ms | 6.13 ms / 12.00 ms | 8 | 1 |
+| layers ≤ 128 | 1.41 ms / 3.06 ms | 22.45 ms / 36.91 ms | 2 | 1 |
+| maps ≤ 1024 | 240.7 µs / 68.92 ms | 1.64 ms / 3.66 ms | 28 | 510 |
+| **default (layers ≤ 32, maps ≤ 512, gap 16)** | **189.5 µs / 67.75 ms** | **859.1 µs / 1.75 ms** | 51 | 131 |
+
+The p99 snapshot (~68 ms) of every compacting configuration is the full flatten.
+
+The headline benchmark is unchanged by Week 2 (`bench-fork … 1000`): S1 write-protect + pool forks in **93.4 µs / 159.5 µs**. S0 spawn dropped from 31.5 to 25.8 ms with pre-faulting.
 
 ### 2026-10-11 — Layer pool + write-protect tracking
 Same setup as the Week 1 entry below. `forkasm-cli bench-fork … 1000` (median / p99):

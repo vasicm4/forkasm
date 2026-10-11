@@ -78,7 +78,7 @@ pub struct Compaction {
 
 impl Default for Compaction {
     fn default() -> Self {
-        Compaction { max_layers: 64, max_runs: 4096, gap_pages: 16 }
+        Compaction { max_layers: 32, max_runs: 512, gap_pages: 16 }
     }
 }
 
@@ -174,7 +174,12 @@ impl Runtime {
 
     /// Instantiates a fresh root sandbox and runs its initialisers.
     pub fn spawn(&self, module: &GuestModule, opts: SpawnOpts) -> Result<Sandbox> {
+        let mut vfs = crate::vfs::Vfs::default();
+        for (guest, host) in &opts.mounts {
+            vfs.mount_host(guest, host).with_context(|| format!("mounting {} at {guest}", host.display()))?;
+        }
         let wasi = WasiState {
+            vfs,
             args: opts.args.into(),
             env: opts.env.into(),
             clock: Clock { real: self.config.real_time, ..Clock::default() },
@@ -206,6 +211,9 @@ pub struct SpawnOpts {
     pub env: Vec<(String, String)>,
     /// RNG seed of the root.
     pub seed: u64,
+    /// Host directories copied read-only into the root's filesystem, as
+    /// `(guest path, host path)`; shared by every fork.
+    pub mounts: Vec<(String, std::path::PathBuf)>,
 }
 
 /// A rewritten, compiled guest, ready to spawn. Cheap to clone.
