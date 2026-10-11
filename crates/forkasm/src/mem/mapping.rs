@@ -46,7 +46,7 @@ impl Mapping {
 
     /// Maps the whole of `stack` over `[0, len)` and makes it accessible.
     fn compose(&self, stack: &LayerStack, len: usize) -> io::Result<()> {
-        assert!(len <= self.reservation && len % PAGE == 0);
+        assert!(len <= self.reservation && len.is_multiple_of(PAGE));
         assert!(stack.byte_size() <= len);
         // SAFETY: `[base, base + len)` is inside our reservation and the
         // sandbox is quiescent (no guest code holds references into it). The
@@ -156,6 +156,7 @@ impl MemHandle {
         self.0.accessible()
     }
 
+    #[cfg(test)]
     pub(crate) fn reservation(&self) -> usize {
         self.0.reservation
     }
@@ -176,13 +177,12 @@ impl MemHandle {
         assert!(self.len() == 0 && stack.base().size() >= self.0.reservation);
         // SAFETY: the reservation is ours and still entirely `PROT_NONE`; the
         // base file covers all of it.
-        unsafe {
-            sys::map_file_fixed(self.0.base, self.0.reservation, stack.base().fd(), 0, false)?
-        };
+        unsafe { sys::map_file_fixed(self.0.base, self.0.reservation, stack.base().fd(), 0, false)? };
         self.0.compose(stack, len)
     }
 
     /// Replaces the current contents with `stack` (discarding private pages).
+    #[cfg(test)] // Used by compaction (Week 2).
     pub(crate) fn compose(&self, stack: &LayerStack) -> io::Result<()> {
         self.0.compose(stack, self.len())
     }

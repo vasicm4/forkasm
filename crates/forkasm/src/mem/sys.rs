@@ -26,29 +26,12 @@ pub(crate) fn reserve(len: usize) -> std::io::Result<*mut u8> {
     Ok(p.cast())
 }
 
-/// Replaces `[addr, addr + len)` with a private anonymous zero mapping.
-///
-/// # Safety
-/// `[addr, addr + len)` must lie inside a reservation owned by the caller,
-/// and nothing may hold references into it.
-pub(crate) unsafe fn map_anon_fixed(addr: *mut u8, len: usize, rw: bool) -> std::io::Result<()> {
-    // SAFETY: forwarded to the caller's contract.
-    unsafe {
-        mmap_anonymous(
-            addr.cast::<c_void>(),
-            len,
-            prot(rw),
-            MapFlags::PRIVATE | MapFlags::FIXED | MapFlags::NORESERVE,
-        )?;
-    }
-    Ok(())
-}
-
 /// Maps `fd[off, off + len)` privately (copy-on-write) at `addr`, replacing
 /// whatever was there.
 ///
 /// # Safety
-/// As for [`map_anon_fixed`].
+/// `[addr, addr + len)` must lie inside a reservation owned by the caller,
+/// and nothing may hold references into it.
 pub(crate) unsafe fn map_file_fixed(
     addr: *mut u8,
     len: usize,
@@ -71,7 +54,7 @@ pub(crate) unsafe fn map_file_fixed(
 }
 
 /// # Safety
-/// As for [`map_anon_fixed`].
+/// As for [`map_file_fixed`].
 pub(crate) unsafe fn protect_rw(addr: *mut u8, len: usize) -> std::io::Result<()> {
     if len == 0 {
         return Ok(());
@@ -91,9 +74,5 @@ pub(crate) unsafe fn unmap(addr: *mut u8, len: usize) -> std::io::Result<()> {
 }
 
 fn prot(rw: bool) -> ProtFlags {
-    if rw {
-        ProtFlags::READ | ProtFlags::WRITE
-    } else {
-        ProtFlags::empty()
-    }
+    if rw { ProtFlags::READ | ProtFlags::WRITE } else { ProtFlags::empty() }
 }

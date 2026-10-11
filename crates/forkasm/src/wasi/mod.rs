@@ -1,0 +1,279 @@
+//! Our own `wasi_snapshot_preview1` (SPEC §5.4).
+//!
+//! All sandbox-visible state lives in [`WasiState`], which is plain data and
+//! cloned on fork. Clock and RNG are deterministic unless real time is asked
+//! for. Calls we don't implement return `ENOSYS` and are logged once.
+
+mod rng;
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
+
+use wasmtime::{Caller, Extern, Linker, Module, Val, ValType};
+
+pub use rng::Rng;
+
+pub(crate) const MODULE: &str = "wasi_snapshot_preview1";
+
+/// WASI errno values.
+mod errno {
+    pub const SUCCESS: i32 = 0;
+    pub const BADF: i32 = 8;
+    pub const FAULT: i32 = 21;
+    pub const INVAL: i32 = 28;
+    pub const NOSYS: i32 = 52;
+}
+
+/// The guest called `proc_exit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("guest exited with code {0}")]
+pub struct Exit(pub i32);
+
+/// Virtual time: every clock read advances it by `tick_ns`.
+#[derive(Clone, Debug)]
+pub struct Clock {
+    pub now_ns: u64,
+    pub tick_ns: u64,
+    /// Read the host clock instead (non-deterministic, opt-in).
+    pub real: bool,
+}
+
+/// Start of virtual realtime: 2026-01-01T00:00:00Z.
+const EPOCH_NS: u64 = 1_767_225_600 * 1_000_000_000;
+
+impl Default for Clock {
+    fn default() -> Self {
+        Clock { now_ns: 0, tick_ns: 1_000, real: false }
+    }
+}
+
+impl Clock {
+    fn read(&mut self, realtime: bool) -> u64 {
+        if self.real {
+            static START: OnceLock<Instant> = OnceLock::new();
+            return if realtime {
+                let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+                now.unwrap_or_default().as_nanos() as u64
+            } else {
+                START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+            };
+        }
+        self.now_ns += self.tick_ns;
+        if realtime { EPOCH_NS + self.now_ns } else { self.now_ns }
+    }
+}
+
+/// Everything a guest can observe through WASI. Cloned on fork.
+#[derive(Clone, Debug, Default)]
+pub struct WasiState {
+    pub args: Arc<[String]>,
+    pub env: Arc<[(String, String)]>,
+    pub clock: Clock,
+    pub rng: Rng,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit: Option<i32>,
+}
+
+const IMPLEMENTED: &[&str] = &[
+    "args_sizes_get",
+    "args_get",
+    "environ_sizes_get",
+    "environ_get",
+    "clock_time_get",
+    "random_get",
+    "fd_write",
+    "fd_fdstat_get",
+    "fd_prestat_get",
+    "fd_prestat_dir_name",
+    "fd_close",
+    "proc_exit",
+];
+
+/// Adds our preview1 functions, plus an `ENOSYS` stub for every other
+/// preview1 import of `module`, to `linker`.
+pub(crate) fn add_to_linker(linker: &mut Linker<WasiState>, module: &Module) -> anyhow::Result<()> {
+    linker.func_wrap(MODULE, "args_sizes_get", |mut c: Caller<'_, WasiState>, argc: i32, size: i32| {
+        let args = c.data().args.clone();
+        let total: usize = args.iter().map(|a| a.len() + 1).sum();
+        with_mem(&mut c, |m, _| {
+            m.write_u32(argc, args.len() as u32)?;
+            m.write_u32(size, total as u32)
+        })
+    })?;
+    linker.func_wrap(MODULE, "args_get", |mut c: Caller<'_, WasiState>, argv: i32, buf: i32| {
+        let args = c.data().args.clone();
+        with_mem(&mut c, |m, _| m.write_strings(argv, buf, args.iter().map(|a| a.as_bytes().to_vec())))
+    })?;
+    linker.func_wrap(MODULE, "environ_sizes_get", |mut c: Caller<'_, WasiState>, n: i32, size: i32| {
+        let env = c.data().env.clone();
+        let total: usize = env.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+        with_mem(&mut c, |m, _| {
+            m.write_u32(n, env.len() as u32)?;
+            m.write_u32(size, total as u32)
+        })
+    })?;
+    linker.func_wrap(MODULE, "environ_get", |mut c: Caller<'_, WasiState>, ptrs: i32, buf: i32| {
+        let env = c.data().env.clone();
+        let entries = env.iter().map(|(k, v)| format!("{k}={v}").into_bytes());
+        with_mem(&mut c, |m, _| m.write_strings(ptrs, buf, entries))
+    })?;
+    linker.func_wrap(
+        MODULE,
+        "clock_time_get",
+        |mut c: Caller<'_, WasiState>, id: i32, _precision: i64, out: i32| {
+            // 0 = realtime, 1 = monotonic; process/thread CPU time read as monotonic.
+            if !(0..=3).contains(&id) {
+                return Ok(errno::INVAL);
+            }
+            with_mem(&mut c, |m, s| m.write_u64(out, s.clock.read(id == 0)))
+        },
+    )?;
+    linker.func_wrap(MODULE, "random_get", |mut c: Caller<'_, WasiState>, buf: i32, len: i32| {
+        with_mem(&mut c, |m, s| {
+            let dst = m.slice_mut(buf, len as u32)?;
+            s.rng.fill(dst);
+            Ok(errno::SUCCESS)
+        })
+    })?;
+    linker.func_wrap(
+        MODULE,
+        "fd_write",
+        |mut c: Caller<'_, WasiState>, fd: i32, iovs: i32, n_iovs: i32, out: i32| {
+            with_mem(&mut c, |m, s| {
+                let sink = match fd {
+                    1 => &mut s.stdout,
+                    2 => &mut s.stderr,
+                    _ => return Ok(errno::BADF),
+                };
+                let mut written = 0u32;
+                for i in 0..n_iovs as u32 {
+                    let iov = iovs.wrapping_add((i * 8) as i32);
+                    let (ptr, len) = (m.read_u32(iov)?, m.read_u32(iov.wrapping_add(4))?);
+                    sink.extend_from_slice(m.slice_mut(ptr as i32, len)?);
+                    written += len;
+                }
+                m.write_u32(out, written)
+            })
+        },
+    )?;
+    linker.func_wrap(MODULE, "fd_fdstat_get", |mut c: Caller<'_, WasiState>, fd: i32, out: i32| {
+        if !(0..=2).contains(&fd) {
+            return Ok(errno::BADF);
+        }
+        with_mem(&mut c, |m, _| {
+            let stat = m.slice_mut(out, 24)?;
+            stat.fill(0);
+            stat[0] = 2; // filetype: character device
+            // rights: fd_read (bit 1) for stdin, fd_write (bit 6) for stdout/stderr.
+            let rights: u64 = if fd == 0 { 1 << 1 } else { 1 << 6 };
+            stat[8..16].copy_from_slice(&rights.to_le_bytes());
+            Ok(errno::SUCCESS)
+        })
+    })?;
+    // No preopened directories until the VFS lands (Week 2).
+    linker.func_wrap(MODULE, "fd_prestat_get", |_: Caller<'_, WasiState>, _fd: i32, _out: i32| {
+        Ok(errno::BADF)
+    })?;
+    linker.func_wrap(
+        MODULE,
+        "fd_prestat_dir_name",
+        |_: Caller<'_, WasiState>, _fd: i32, _p: i32, _l: i32| Ok(errno::BADF),
+    )?;
+    linker.func_wrap(MODULE, "fd_close", |_: Caller<'_, WasiState>, fd: i32| {
+        Ok(if (0..=2).contains(&fd) { errno::SUCCESS } else { errno::BADF })
+    })?;
+    linker.func_wrap(
+        MODULE,
+        "proc_exit",
+        |mut c: Caller<'_, WasiState>, code: i32| -> wasmtime::Result<()> {
+            c.data_mut().exit = Some(code);
+            Err(wasmtime::Error::new(Exit(code)))
+        },
+    )?;
+
+    for import in module.imports() {
+        if import.module() != MODULE || IMPLEMENTED.contains(&import.name()) {
+            continue;
+        }
+        let Some(ty) = import.ty().func().cloned() else { continue };
+        let name = import.name().to_string();
+        let returns_errno = ty.results().len() == 1 && matches!(ty.results().next(), Some(ValType::I32));
+        linker.func_new(MODULE, &name.clone(), ty, move |_, _, results| {
+            log_once(&name);
+            if returns_errno {
+                results[0] = Val::I32(errno::NOSYS);
+                Ok(())
+            } else {
+                wasmtime::bail!("unimplemented WASI call {name}")
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn log_once(name: &str) {
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_default().insert(name.to_string()) {
+        eprintln!("forkasm: unimplemented WASI call {MODULE}::{name} -> ENOSYS");
+    }
+}
+
+/// Bounds-checked access to guest memory; out-of-bounds becomes `EFAULT`.
+struct GuestMem<'a>(&'a mut [u8]);
+
+/// Errors inside a WASI call: an errno for the guest.
+type Errno = i32;
+
+impl GuestMem<'_> {
+    fn slice_mut(&mut self, ptr: i32, len: u32) -> Result<&mut [u8], Errno> {
+        let start = ptr as u32 as usize;
+        let end = start.checked_add(len as usize).ok_or(errno::FAULT)?;
+        self.0.get_mut(start..end).ok_or(errno::FAULT)
+    }
+
+    fn read_u32(&mut self, ptr: i32) -> Result<u32, Errno> {
+        Ok(u32::from_le_bytes(self.slice_mut(ptr, 4)?.try_into().unwrap()))
+    }
+
+    fn write_u32(&mut self, ptr: i32, v: u32) -> Result<Errno, Errno> {
+        self.slice_mut(ptr, 4)?.copy_from_slice(&v.to_le_bytes());
+        Ok(errno::SUCCESS)
+    }
+
+    fn write_u64(&mut self, ptr: i32, v: u64) -> Result<Errno, Errno> {
+        self.slice_mut(ptr, 8)?.copy_from_slice(&v.to_le_bytes());
+        Ok(errno::SUCCESS)
+    }
+
+    /// Writes NUL-terminated `strings` to `buf` and their addresses to `ptrs`.
+    fn write_strings(
+        &mut self,
+        ptrs: i32,
+        buf: i32,
+        strings: impl Iterator<Item = Vec<u8>>,
+    ) -> Result<Errno, Errno> {
+        let mut at = buf as u32;
+        for (i, mut s) in strings.enumerate() {
+            s.push(0);
+            self.write_u32(ptrs.wrapping_add(4 * i as i32), at)?;
+            self.slice_mut(at as i32, s.len() as u32)?.copy_from_slice(&s);
+            at += s.len() as u32;
+        }
+        Ok(errno::SUCCESS)
+    }
+}
+
+/// Runs `f` with the guest's exported memory and the WASI state.
+fn with_mem(
+    caller: &mut Caller<'_, WasiState>,
+    f: impl FnOnce(&mut GuestMem<'_>, &mut WasiState) -> Result<Errno, Errno>,
+) -> wasmtime::Result<i32> {
+    let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+        wasmtime::bail!("guest exports no memory");
+    };
+    let (bytes, state) = mem.data_and_store_mut(caller);
+    Ok(f(&mut GuestMem(bytes), state).unwrap_or_else(|e| e))
+}

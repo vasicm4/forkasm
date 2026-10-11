@@ -1,0 +1,35 @@
+//! Shared helpers for integration tests and benches.
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
+
+use forkasm::{Config, Runtime, Strategy};
+
+/// Builds `guests/kv` for `wasm32-wasip1` (once per process) and returns the
+/// module path.
+pub fn kv_wasm() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guests/kv");
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "--quiet", "--release", "--target", "wasm32-wasip1", "--manifest-path"])
+            .arg(dir.join("Cargo.toml"))
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .status()
+            .expect("running cargo");
+        assert!(
+            status.success(),
+            "building guests/kv failed; is the target installed? `rustup target add wasm32-wasip1`"
+        );
+        dir.join("target/wasm32-wasip1/release/kv.wasm")
+    })
+}
+
+pub fn runtime(strategy: Strategy) -> Runtime {
+    Runtime::new(Config { strategy, ..Config::default() }).unwrap()
+}
+
+pub const STRATEGIES: [Strategy; 2] = [Strategy::Copy, Strategy::Layered];

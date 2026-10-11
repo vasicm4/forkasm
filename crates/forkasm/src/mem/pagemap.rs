@@ -47,7 +47,7 @@ pub(super) fn with_pagemap<R>(f: impl FnOnce(&File) -> io::Result<R>) -> io::Res
 
 /// Dirty runs in `[addr, addr + len)`, as page indices relative to `addr`.
 pub(super) fn dirty_runs(addr: usize, len: usize, scan: DirtyScan) -> io::Result<Vec<Run>> {
-    assert!(addr % PAGE == 0 && len % PAGE == 0);
+    assert!(addr.is_multiple_of(PAGE) && len.is_multiple_of(PAGE));
     match scan {
         DirtyScan::Pagemap => read_pagemap(addr, len),
         DirtyScan::PagemapScan => pagemap_scan(addr, len),
@@ -59,9 +59,7 @@ pub(super) fn read_entries(addr: usize, pages: usize) -> io::Result<Vec<u64>> {
     with_pagemap(|f| {
         // SAFETY: a `u64` slice can be viewed as bytes; every bit pattern is a
         // valid `u64`.
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(entries.as_mut_ptr().cast::<u8>(), pages * 8)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(entries.as_mut_ptr().cast::<u8>(), pages * 8) };
         f.read_exact_at(bytes, (addr / PAGE * 8) as u64)
     })?;
     Ok(entries)

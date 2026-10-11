@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use wasmtime::{LinearMemory, MemoryCreator, MemoryType};
 
+use super::PAGE;
 use super::layer::LayerStack;
 use super::mapping::{MemHandle, Region};
-use super::PAGE;
 
 /// Initial contents of the next memory created on this thread.
 pub(crate) enum MemInit {
@@ -78,7 +78,7 @@ unsafe impl MemoryCreator for ForkasmMemoryCreator {
         let init = NEXT.with_borrow_mut(Option::take).unwrap_or(MemInit::Zero);
         let reservation = reserved_size_in_bytes.unwrap_or(DEFAULT_RESERVATION);
         let size = minimum.max(init.byte_size());
-        if size > reservation || maximum.is_some_and(|m| size > m) || size % PAGE != 0 {
+        if size > reservation || maximum.is_some_and(|m| size > m) || !size.is_multiple_of(PAGE) {
             return Err(format!("bad initial memory size {size}"));
         }
         let (region, handle) = Region::reserve(reservation, guard_size_in_bytes, maximum)

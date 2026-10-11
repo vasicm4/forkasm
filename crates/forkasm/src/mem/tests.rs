@@ -32,8 +32,7 @@ struct Guest {
 impl Guest {
     fn new(engine: &Engine, module: &Module, init: MemInit) -> Guest {
         let mut store = Store::new(engine, ());
-        let (instance, mem) =
-            instantiate_with(init, || Ok(Instance::new(&mut store, module, &[])?)).unwrap();
+        let (instance, mem) = instantiate_with(init, || Ok(Instance::new(&mut store, module, &[])?)).unwrap();
         Guest {
             load: instance.get_typed_func(&mut store, "load").unwrap(),
             store_fn: instance.get_typed_func(&mut store, "store").unwrap(),

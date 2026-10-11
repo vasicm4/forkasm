@@ -78,7 +78,7 @@ pub(crate) struct LayerStack {
 
 impl LayerStack {
     pub(crate) fn root(base: Arc<BaseImage>, byte_size: usize) -> LayerStack {
-        assert!(byte_size % PAGE == 0 && byte_size <= base.size());
+        assert!(byte_size.is_multiple_of(PAGE) && byte_size <= base.size());
         LayerStack { base, layers: Vec::new(), byte_size }
     }
 
