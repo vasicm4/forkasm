@@ -1,0 +1,20 @@
+[package]
+name = "forkasm"
+version = "0.1.0"
+description = "Microsecond live branching of WebAssembly sandboxes"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+wasmtime.workspace = true
+rustix.workspace = true
+walrus.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+wat.workspace = true
+criterion.workspace = true
