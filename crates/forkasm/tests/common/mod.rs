@@ -33,10 +33,20 @@ pub fn runtime(strategy: Strategy) -> Runtime {
     Runtime::new(Config { strategy, ..Config::default() }).unwrap()
 }
 
-pub const STRATEGIES: [Strategy; 2] = [Strategy::Copy, Strategy::Layered];
+/// S0, S1, and S2 when the kernel supports it.
+pub fn strategies() -> Vec<Strategy> {
+    let mut s = vec![Strategy::Copy, Strategy::Layered];
+    if forkasm::mem::write_protect_available().is_ok() {
+        s.push(Strategy::Lazy);
+    } else {
+        eprintln!("userfaultfd write-protect unavailable; S2 not tested");
+    }
+    s
+}
 
-/// Every S1 variant: each dirty-tracking mode, and running without a pool.
-/// Write-protect is skipped when the kernel lacks it.
+/// Every S1 variant (each dirty-tracking mode, without a pool, with tight
+/// compaction) and S2. Write-protect (and so S2) is skipped when the kernel
+/// lacks it.
 pub fn layered_configs() -> Vec<Config> {
     let mut modes = vec![DirtyTracking::PagemapScan, DirtyTracking::Pagemap];
     if forkasm::mem::write_protect_available().is_ok() {
@@ -57,6 +67,12 @@ pub fn layered_configs() -> Vec<Config> {
         .map(|c| Config { compaction: Some(tight), ..c.clone() })
         .collect();
     configs.extend(tightened);
+    // S2: lazy filling, with default and tight compaction.
+    if forkasm::mem::write_protect_available().is_ok() {
+        for compaction in [Some(Compaction::default()), Some(tight)] {
+            configs.push(Config { strategy: Strategy::Lazy, compaction, ..Config::default() });
+        }
+    }
     configs
 }
 
@@ -98,4 +114,32 @@ pub fn work(sb: &mut Sandbox, buf_pages: i32, seed: u64) {
         // Grow memory now and then.
         sb.call("alloc", &[Val::I32(70_000)]).unwrap();
     }
+}
+
+/// Builds `guests/py` (CPython 3.12, G2) once per process with
+/// `guests/py/build.sh`, which downloads its toolchain on first use, and
+/// returns the module path and the stdlib directory to mount at
+/// [`forkasm::python::PY_LIB`].
+pub fn py_wasm() -> &'static (PathBuf, PathBuf) {
+    static PATHS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    PATHS.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guests/py");
+        let wasm = dir.join("out/py.wasm");
+        let stale = |src: &str| {
+            let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            modified(&dir.join(src)) > modified(&wasm)
+        };
+        if !wasm.exists() || stale("driver.c") || stale("build.sh") {
+            let status = Command::new(dir.join("build.sh")).status().expect("running guests/py/build.sh");
+            assert!(status.success(), "building guests/py failed");
+        }
+        (wasm, dir.join("out/lib"))
+    })
+}
+
+/// Spawns a G2 root with the stdlib mounted and the interpreter initialised.
+pub fn py_root(rt: &Runtime) -> Sandbox {
+    let (wasm, lib) = py_wasm();
+    let module = rt.load(wasm).unwrap();
+    forkasm::python::spawn(rt, &module, lib).unwrap()
 }

@@ -1,3 +1,4 @@
 /target
 /guests/*/target
 /.idea
+/guests/py/out

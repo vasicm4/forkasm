@@ -132,16 +132,36 @@ impl LayerStack {
         self.byte_size
     }
 
-    /// Every page any layer holds, as sorted runs merged across `gap`-page
-    /// holes, together with `extra`.
-    pub(crate) fn covered_runs(&self, extra: &[Run], gap: usize) -> Vec<Run> {
-        let all = self.layers.iter().flat_map(|l| l.runs().iter().copied()).chain(extra.iter().copied());
+    /// Every page layers `from..` hold, as sorted runs merged across
+    /// `gap`-page holes, together with `extra`.
+    pub(crate) fn covered_runs(&self, from: usize, extra: &[Run], gap: usize) -> Vec<Run> {
+        let all =
+            self.layers[from..].iter().flat_map(|l| l.runs().iter().copied()).chain(extra.iter().copied());
         super::coalesce(all.collect(), gap)
     }
 
-    /// Just the base image, describing a memory of `byte_size`.
-    pub(crate) fn base_only(&self, byte_size: usize) -> LayerStack {
-        LayerStack { base: self.base.clone(), layers: Vec::new(), byte_size, plan: Arc::default() }
+    /// The bottom `keep` layers, describing a memory of `byte_size`.
+    pub(crate) fn truncated(&self, keep: usize, byte_size: usize) -> LayerStack {
+        assert!(byte_size >= self.byte_size);
+        let layers = self.layers[..keep].to_vec();
+        LayerStack { base: self.base.clone(), layers, byte_size, plan: Arc::default() }
+    }
+
+    /// How many mappings a spawn would need if layers `keep..` were replaced
+    /// by one layer holding `top` (sorted, disjoint runs).
+    pub(crate) fn segments_with_top(&self, keep: usize, top: &[Run]) -> usize {
+        let mut runs: Vec<Vec<(Run, usize)>> =
+            self.layers[..keep].iter().map(|l| l.mapped_runs().collect()).collect();
+        let mut off = 0;
+        runs.push(
+            top.iter()
+                .map(|&r| {
+                    off += r.byte_len();
+                    (r, off - r.byte_len())
+                })
+                .collect(),
+        );
+        paint(&runs).len()
     }
 
     /// The mappings a spawn makes on top of the base image: for every page

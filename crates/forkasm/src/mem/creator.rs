@@ -22,6 +22,8 @@ pub(crate) enum MemInit {
     /// A composite CoW mapping of these layers (strategy S1), optionally
     /// registered for write tracking.
     Layers(LayerStack, bool),
+    /// Filled from these layers page by page on first access (strategy S2).
+    Lazy(LayerStack),
 }
 
 impl MemInit {
@@ -29,7 +31,7 @@ impl MemInit {
         match self {
             MemInit::Zero => 0,
             MemInit::Copy(bytes) => bytes.len(),
-            MemInit::Layers(stack, _) => stack.byte_size(),
+            MemInit::Layers(stack, _) | MemInit::Lazy(stack) => stack.byte_size(),
         }
     }
 }
@@ -88,6 +90,7 @@ unsafe impl MemoryCreator for ForkasmMemoryCreator {
             MemInit::Zero => handle.init_zero(size),
             MemInit::Copy(bytes) => handle.init_zero(size).and_then(|()| handle.fill(bytes)),
             MemInit::Layers(stack, track) => handle.init_layers(stack, size, *track),
+            MemInit::Lazy(stack) => handle.init_lazy(stack, size),
         };
         init_result.map_err(|e| format!("initialising memory: {e}"))?;
         CREATED.with_borrow_mut(|c| *c = Some(handle));

@@ -6,6 +6,7 @@
 //! implement return `ENOSYS` and are logged once.
 
 mod fs;
+mod output;
 mod rng;
 
 use std::collections::HashSet;
@@ -15,6 +16,7 @@ use std::time::{Instant, SystemTime};
 use wasmtime::{Caller, Extern, Linker, Module, Val, ValType};
 
 pub use fs::FdTable;
+pub use output::Output;
 pub use rng::Rng;
 
 use crate::vfs::Vfs;
@@ -93,8 +95,8 @@ pub struct WasiState {
     pub env: Arc<[(String, String)]>,
     pub clock: Clock,
     pub rng: Rng,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+    pub stdout: Output,
+    pub stderr: Output,
     pub exit: Option<i32>,
     pub vfs: Vfs,
     pub fds: FdTable,

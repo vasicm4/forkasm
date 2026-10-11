@@ -608,6 +608,7 @@ dependencies = [
  "imbl",
  "libc",
  "proptest",
+ "rayon",
  "rustix",
  "thiserror",
  "walrus",
@@ -621,6 +622,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "forkasm",
+ "rayon",
 ]
 
 [[package]]

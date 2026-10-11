@@ -23,6 +23,10 @@ pub enum Strategy {
     /// copy-on-write.
     #[default]
     Layered,
+    /// S2: snapshots as S1; spawn maps nothing and fills each page from the
+    /// layers on first access (userfaultfd). Needs write-protect tracking,
+    /// which it always uses.
+    Lazy,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +94,9 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(mut config: Config) -> Result<Runtime> {
+        if config.strategy == Strategy::Lazy {
+            config.dirty_tracking = DirtyTracking::WriteProtect;
+        }
         if config.dirty_tracking == DirtyTracking::WriteProtect {
             crate::mem::write_protect_available().map_err(anyhow::Error::msg)?;
         }
@@ -110,9 +117,11 @@ impl Runtime {
             .wasm_multi_memory(false)
             .wasm_memory64(false);
         let pool = match (config.strategy, config.layer_pool) {
-            (Strategy::Layered, Some(pool)) => Some(pool),
+            (Strategy::Layered | Strategy::Lazy, Some(pool)) => Some(pool),
             // A pool with nothing ready: every slab is allocated on demand.
-            (Strategy::Layered, None) => Some(PoolConfig { ready_slabs: 0, ..PoolConfig::default() }),
+            (Strategy::Layered | Strategy::Lazy, None) => {
+                Some(PoolConfig { ready_slabs: 0, ..PoolConfig::default() })
+            }
             (Strategy::Copy, _) => None,
         };
         let pool = pool.map(LayerPool::new).transpose()?.map(Arc::new);
@@ -154,7 +163,7 @@ impl Runtime {
         let pre = linker.instantiate_pre(&module)?;
         let initial = match self.config.strategy {
             Strategy::Copy => MemSnap::Copy(image_bytes(&rw.image).into()),
-            Strategy::Layered => {
+            Strategy::Layered | Strategy::Lazy => {
                 let size = self.config.memory_reservation as usize;
                 let segments = rw.image.segments.iter().map(|(off, b)| (*off as usize, &b[..]));
                 let base = Arc::new(BaseImage::new(size, segments)?);
@@ -166,6 +175,7 @@ impl Runtime {
             initial,
             globals: rw.globals,
             has_start: rw.has_start,
+            lazy: self.config.strategy == Strategy::Lazy,
             dirty_tracking: self.config.dirty_tracking,
             compaction: self.config.compaction,
             pool: self.pool.clone(),
@@ -186,7 +196,7 @@ impl Runtime {
             rng: Rng::new(opts.seed),
             ..WasiState::default()
         };
-        let init = module.0.initial.to_init(module.tracks_writes());
+        let init = module.0.initial.to_init(module);
         let mut sb = Sandbox::instantiate(module.clone(), init, wasi, None)?;
         sb.run_initialisers()?;
         Ok(sb)
@@ -224,6 +234,11 @@ impl GuestModule {
     pub(crate) fn tracks_writes(&self) -> bool {
         self.0.dirty_tracking == DirtyTracking::WriteProtect
     }
+
+    /// Spawns fill memory lazily (S2).
+    pub(crate) fn lazy(&self) -> bool {
+        self.0.lazy
+    }
 }
 
 pub(crate) struct ModuleInner {
@@ -232,6 +247,7 @@ pub(crate) struct ModuleInner {
     pub(crate) initial: MemSnap,
     pub(crate) globals: Vec<String>,
     pub(crate) has_start: bool,
+    pub(crate) lazy: bool,
     pub(crate) dirty_tracking: DirtyTracking,
     pub(crate) compaction: Option<Compaction>,
     /// Layer storage (S1 only).
@@ -239,10 +255,12 @@ pub(crate) struct ModuleInner {
 }
 
 impl MemSnap {
-    pub(crate) fn to_init(&self, track_writes: bool) -> MemInit {
+    /// How a sandbox of `module` starts from this memory.
+    pub(crate) fn to_init(&self, module: &GuestModule) -> MemInit {
         match self {
             MemSnap::Copy(bytes) => MemInit::Copy(bytes.clone()),
-            MemSnap::Layered(stack) => MemInit::Layers(stack.clone(), track_writes),
+            MemSnap::Layered(stack) if module.lazy() => MemInit::Lazy(stack.clone()),
+            MemSnap::Layered(stack) => MemInit::Layers(stack.clone(), module.tracks_writes()),
         }
     }
 }

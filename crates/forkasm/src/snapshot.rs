@@ -15,7 +15,7 @@ use crate::wasi::WasiState;
 pub(crate) enum MemSnap {
     /// S0: a full copy.
     Copy(Arc<[u8]>),
-    /// S1: base image plus layers.
+    /// S1 and S2: base image plus layers.
     Layered(LayerStack),
 }
 
@@ -37,7 +37,7 @@ impl Snapshot {
         let s = &self.0;
         let mut wasi = s.wasi.clone();
         wasi.rng = wasi.rng.fork(branch);
-        Sandbox::instantiate(s.module.clone(), s.mem.to_init(s.module.tracks_writes()), wasi, Some(self))
+        Sandbox::instantiate(s.module.clone(), s.mem.to_init(&s.module), wasi, Some(self))
     }
 
     /// Number of snapshots between this one and its root sandbox.

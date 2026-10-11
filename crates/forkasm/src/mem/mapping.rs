@@ -11,7 +11,7 @@ use wasmtime::LinearMemory;
 use super::layer::{Layer, LayerStack};
 use super::pagemap::{self, DirtyTracking};
 use super::pool::LayerPool;
-use super::{PAGE, Run, sys, uffd};
+use super::{PAGE, Run, lazy, sys, uffd};
 
 /// One reservation: `reservation` bytes usable by the guest followed by
 /// `guard` bytes that stay `PROT_NONE`. Unmapped when the last of the
@@ -24,6 +24,8 @@ struct Mapping {
     accessible: AtomicUsize,
     /// Registered for userfaultfd write tracking.
     tracked: AtomicBool,
+    /// Filled lazily on first access (S2, [`super::lazy`]).
+    lazy: AtomicBool,
     /// Every layer currently mapped. Layer pages live in shared slabs that are
     /// hole-punched when the layer is dropped, so the mapping must keep them
     /// alive (unlike a plain file, which the mapping itself would keep open).
@@ -40,6 +42,9 @@ unsafe impl Sync for Mapping {}
 
 impl Drop for Mapping {
     fn drop(&mut self) {
+        if *self.lazy.get_mut() {
+            lazy::unregister(self.base as usize);
+        }
         // SAFETY: we own the whole reservation, and the last reference to it
         // (Wasmtime's `Region` and every `MemHandle`) is gone.
         let _ = unsafe { sys::unmap(self.base, self.reservation + self.guard) };
@@ -151,6 +156,7 @@ impl Region {
             guard,
             accessible: AtomicUsize::new(0),
             tracked: AtomicBool::new(false),
+            lazy: AtomicBool::new(false),
             pinned: Mutex::new(Vec::new()),
         });
         Ok((Region { map: map.clone(), maximum }, MemHandle(map)))
@@ -228,8 +234,33 @@ impl MemHandle {
         self.0.compose(stack, len)
     }
 
+    /// Makes `[0, len)` accessible, filling every page of the reservation
+    /// from `stack` on first access (S2). Tracks writes like
+    /// [`DirtyTracking::WriteProtect`].
+    pub(super) fn init_lazy(&self, stack: &LayerStack, len: usize) -> io::Result<()> {
+        assert!(self.len() == 0 && stack.base().size() >= self.0.reservation && stack.byte_size() <= len);
+        // SAFETY: the reservation is ours and still entirely `PROT_NONE`, so
+        // nothing references it.
+        unsafe { sys::protect_rw(self.0.base, len)? };
+        self.0.accessible.store(len, Ordering::Release);
+        self.0.lazy.store(true, Ordering::Release);
+        lazy::register(self.0.base as usize, self.0.reservation, stack)
+    }
+
+    /// Whether this memory is filled lazily (S2).
+    pub(crate) fn is_lazy(&self) -> bool {
+        self.0.lazy.load(Ordering::Acquire)
+    }
+
     /// Replaces the current contents with `stack` (discarding private pages).
+    ///
+    /// A lazily filled memory is left as it is: compaction only calls this
+    /// with a stack holding exactly the current contents, and its write
+    /// tracking was already reset by the scan before the capture.
     pub(crate) fn compose(&self, stack: &LayerStack) -> io::Result<()> {
+        if self.is_lazy() {
+            return Ok(());
+        }
         self.0.compose(stack, self.len())
     }
 
@@ -284,6 +315,14 @@ impl MemHandle {
 
     /// Copies `runs` of memory into a new layer.
     pub(crate) fn capture_layer(&self, runs: Vec<Run>, pool: &LayerPool) -> io::Result<Layer> {
+        if self.is_lazy() {
+            // Large layers are written with `pwritev`, whose kernel-mode
+            // reads would fail on pages never filled (compaction copies
+            // clean pages too).
+            // SAFETY: the runs are inside the accessible memory (`bytes`
+            // checks them below too) and the sandbox is quiescent.
+            unsafe { lazy::prefault(self.0.base, &runs) };
+        }
         // SAFETY: the sandbox is quiescent and stays so while the slices live
         // (we hold `&self` and the sandbox is borrowed by the caller); `bytes`
         // bounds-checks every run.

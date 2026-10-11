@@ -14,10 +14,11 @@ forkasm = { path = "crates/forkasm" }
 anyhow = "1"
 thiserror = "2"
 wasmtime = { version = "47.0.4", default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "parallel-compilation"] }
-rustix = { version = "1.1", features = ["mm", "fs", "process", "param"] }
+rustix = { version = "1.1", features = ["mm", "fs", "process", "param", "pipe"] }
 walrus = "0.27"
 wat = "1"
 criterion = "0.8"
 proptest = "1.12"
 libc = "0.2"
 imbl = "7"
+rayon = "1"

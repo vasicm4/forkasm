@@ -5,10 +5,12 @@
 
 mod creator;
 mod layer;
+mod lazy;
 mod mapping;
 mod pagemap;
 mod pool;
 pub mod probe;
+mod procfork;
 mod sys;
 mod uffd;
 
@@ -18,6 +20,8 @@ pub(crate) use mapping::MemHandle;
 pub use pagemap::DirtyTracking;
 pub(crate) use pool::LayerPool;
 pub use pool::PoolConfig;
+pub use procfork::ProcessFork;
+pub(crate) use procfork::fork_run;
 pub use uffd::available as write_protect_available;
 
 /// Host page size. forkasm only supports 4 KiB pages (x86_64 / aarch64 default).

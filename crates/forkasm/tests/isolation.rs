@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{STRATEGIES, kv_wasm, runtime};
+use common::{kv_wasm, runtime, strategies};
 use forkasm::{Sandbox, SpawnOpts, Strategy, Val};
 
 fn kv(strategy: Strategy) -> (forkasm::Runtime, Sandbox) {
@@ -31,7 +31,7 @@ fn say(sb: &mut Sandbox, s: &str) {
 
 #[test]
 fn root_runs_with_args_and_env() {
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let rt = runtime(strategy);
         let module = rt.load(kv_wasm()).unwrap();
         let opts = SpawnOpts {
@@ -41,13 +41,13 @@ fn root_runs_with_args_and_env() {
         };
         let mut root = rt.spawn(&module, opts).unwrap();
         root.call("init", &[]).unwrap();
-        assert_eq!(String::from_utf8_lossy(root.stdout()), "kv: ready (args=2, env=1)\n");
+        assert_eq!(String::from_utf8_lossy(&root.stdout()), "kv: ready (args=2, env=1)\n");
     }
 }
 
 #[test]
 fn memory_isolation() {
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let (rt, mut root) = kv(strategy);
         put(&mut root, 1, 10);
         let snap = root.snapshot().unwrap();
@@ -71,7 +71,7 @@ fn memory_isolation() {
 
 #[test]
 fn growth_in_child_only() {
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let (rt, mut root) = kv(strategy);
         let size = root.stats().memory_bytes;
         let snap = root.snapshot().unwrap();
@@ -89,7 +89,7 @@ fn growth_in_child_only() {
 
 #[test]
 fn wasi_state_isolation_and_determinism() {
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let (rt, mut root) = kv(strategy);
         say(&mut root, "before");
         let snap = root.snapshot().unwrap();
@@ -114,9 +114,9 @@ fn wasi_state_isolation_and_determinism() {
         // stdout: children inherit the prefix, then diverge.
         say(&mut a, "child a");
         say(&mut root, "parent");
-        assert_eq!(String::from_utf8_lossy(a.stdout()).lines().last(), Some("child a"));
-        assert_eq!(String::from_utf8_lossy(root.stdout()).lines().last(), Some("parent"));
-        assert!(String::from_utf8_lossy(b.stdout()).ends_with("before\n"));
+        assert_eq!(String::from_utf8_lossy(&a.stdout()).lines().last(), Some("child a"));
+        assert_eq!(String::from_utf8_lossy(&root.stdout()).lines().last(), Some("parent"));
+        assert!(String::from_utf8_lossy(&b.stdout()).ends_with("before\n"));
     }
 }
 
@@ -126,7 +126,7 @@ fn globals_isolation() {
         (global $n (mut i64) (i64.const 0))
         (func (export "inc") (result i64)
             (global.set $n (i64.add (global.get $n) (i64.const 1))) (global.get $n)))"#;
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let rt = runtime(strategy);
         let module = rt.load_bytes(&wat::parse_str(wat).unwrap()).unwrap();
         let mut root = rt.spawn(&module, SpawnOpts::default()).unwrap();
@@ -144,7 +144,7 @@ fn globals_isolation() {
 #[test]
 fn trap_poisons_sandbox() {
     let wat = r#"(module (memory 1) (func (export "boom") unreachable) (func (export "ok")))"#;
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let rt = runtime(strategy);
         let module = rt.load_bytes(&wat::parse_str(wat).unwrap()).unwrap();
         let mut sb = rt.spawn(&module, SpawnOpts::default()).unwrap();

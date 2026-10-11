@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{STRATEGIES, kv_wasm, runtime};
+use common::{kv_wasm, runtime, strategies};
 use forkasm::{Runtime, Sandbox, SpawnOpts, Strategy, Val};
 
 /// Copies `s` into the guest and returns `(ptr, len)` as wasm values.
@@ -59,7 +59,7 @@ fn kv(strategy: Strategy) -> (Runtime, Sandbox) {
 
 #[test]
 fn guest_file_io() {
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let (_rt, mut sb) = kv(strategy);
         assert_eq!(call_path(&mut sb, "fs_mkdir", "/data/sub"), 0);
         assert_eq!(write(&mut sb, "/data/a.txt", b"hello"), 0);
@@ -90,7 +90,7 @@ fn guest_file_io() {
 
 #[test]
 fn file_isolation_between_forks() {
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let (rt, mut root) = kv(strategy);
         assert_eq!(call_path(&mut root, "fs_mkdir", "/d"), 0);
         assert_eq!(write(&mut root, "/d/a", b"v1"), 0);
@@ -116,7 +116,7 @@ fn file_isolation_between_forks() {
 
 #[test]
 fn open_files_survive_forks_with_their_own_offsets() {
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let (rt, mut root) = kv(strategy);
         assert_eq!(write(&mut root, "/f", b"0123456789"), 0);
         let h = call_path(&mut root, "hold_open", "/f");
@@ -152,7 +152,7 @@ fn host_mounts_are_shared_and_read_only() {
     let dir = std::env::temp_dir().join(format!("forkasm-fs-test-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("pkg")).unwrap();
     std::fs::write(dir.join("pkg/mod.py"), b"x = 1\n").unwrap();
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let rt = runtime(strategy);
         let module = rt.load(kv_wasm()).unwrap();
         let opts = SpawnOpts { mounts: vec![("/lib/py".into(), dir.clone())], ..SpawnOpts::default() };
@@ -173,7 +173,7 @@ fn host_mounts_are_shared_and_read_only() {
 
 #[test]
 fn filesystem_replays_deterministically() {
-    for strategy in STRATEGIES {
+    for strategy in strategies() {
         let (rt, mut root) = kv(strategy);
         assert_eq!(write(&mut root, "/seed", b"s"), 0);
         let snap = root.snapshot().unwrap();

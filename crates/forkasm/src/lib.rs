@@ -9,7 +9,9 @@
 //! let kids = rt.spawn_many(&snap, 8)?;
 //! ```
 
+pub mod driver;
 pub mod mem;
+pub mod python;
 pub mod rewrite;
 mod runtime;
 mod sandbox;

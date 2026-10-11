@@ -445,8 +445,8 @@ fn writable_file(s: &WasiState, fd: i32) -> Result<Ino, Errno> {
 fn write(s: &mut WasiState, fd: i32, at: Option<u64>, data: &[u8]) -> Result<u32, Errno> {
     let now = s.clock.peek_realtime();
     match s.fds.get_mut(fd)? {
-        Entry::Stdout => s.stdout.extend_from_slice(data),
-        Entry::Stderr => s.stderr.extend_from_slice(data),
+        Entry::Stdout => s.stdout.append(data),
+        Entry::Stderr => s.stderr.append(data),
         Entry::File { ino, offset, append, write: true, .. } => {
             let ino = *ino;
             let pos = match at {

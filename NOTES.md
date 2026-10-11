@@ -28,6 +28,115 @@ Consequences:
 
 ## Decisions and findings
 
+### 2026-10-11 — Week 3: G2 (CPython), branch driver, Baseline B, S2, benchmark suite
+Started early (Week 3 is scheduled for Oct 24–30), with the user's approval. Per the user, the full benchmark suite is **written and smoke-tested but not run**; full runs come later (commands under Benchmarks).
+
+**G2 — CPython 3.12 (`guests/py`).** It worked on the first build, so there was no need for the QuickJS fallback.
+- `guests/py/build.sh` downloads wasi-sdk 20 and VMware Labs' prebuilt `libpython3.12.a` (built for wasi-sdk 20) into `~/.cache/forkasm-toolchain`, checks their sha256, and links `driver.c` as a WASI reactor.
+  - The driver exports `py_init`, `py_exec(ptr, len)`, `py_get_int(ptr, len)` and `py_alloc`/`py_free`.
+  - Output: `guests/py/out/py.wasm` (19 MB; 4.2 MB of data segments, 4.6 MB initial memory) and `out/lib` (the stdlib as `python312.zip` plus the `os.py` landmark), mounted read-only at `/usr/local/lib`.
+- `py_init` uses an isolated config: no `site` import, unbuffered stdio, no signal handlers, and a fixed hash seed so branches replay identically.
+- CPython hit **no unimplemented WASI call**. The rewrite pass handles it as is: 1 mutable global, 2 data segments, no start function.
+- `forkasm::python` wraps the exports for tests, the CLI and the driver. Tests (`tests/python.rs`) run under every strategy:
+  - forks between statements;
+  - an exception doesn't poison the sandbox;
+  - stdlib imports, files and read-only mounts;
+  - deterministic replay;
+  - S0 equivalence after a statement sequence with forks.
+- **Finding: `random` keeps its state across forks.** The module seeds itself at import, so branches forked after `import random` continue the same sequence (as with `os.fork`). `os.urandom` reads the per-branch WASI RNG, and so does `random.seed()` with no argument after the fork. The driver demo reseeds in each branch.
+- Costs:
+  - Compiling the 19 MB module with Cranelift takes ~3.4–4 s per `Runtime::load`. Wasmtime's compilation cache would remove this; left for the polish week.
+  - Root spawn plus `py_init`: ~22 ms.
+
+**CPython's dirty pattern (`forkasm-cli py-profile`), and tiered compaction.**
+- A small statement (`x += 1`) dirties ~190 KiB (~47 pages) in ~50 separate runs across the heap and stack. Bigger statements dirty 0.5–1 MiB, and `bytearray(8 MiB)` dirties 8 MiB.
+- Snapshots stay cheap (50–150 µs). **Spawn dominates**: each statement adds ~50 runs, and a spawn costs ~3–4 µs per `mmap`. 150–280 mappings cost ~0.6–1 ms, while a spawn from a compacted snapshot (4 mappings) is 24 µs. So spawn cost is the kernel's `mmap` per segment.
+  - Instantiation itself is cheap. Checked with strace: the many `mprotect`s are glibc arena growth during compilation.
+- On an uncompacted chain, the first spawn of a snapshot also pays for building the mapping plan: ~430 µs at 300 layers. Siblings reuse it.
+- **Tiered compaction is implemented** (`sandbox.rs`, `merge_point`). When a snapshot exceeds a threshold, only the newest layers merge with the dirty set into one layer (the gap-filled union of their pages, copied from memory). The rule:
+  - merge the fewest layers such that the layer below is ≥ 2× the merged size (`TIER_RATIO`), so sizes grow geometrically towards the bottom;
+  - the resulting stack must be within **half** of both thresholds (hysteresis, so the next merge is some snapshots away);
+  - if nothing qualifies, everything is flattened, as before.
+
+  `Sandbox::snapshot_compacted` still flattens everything.
+  - Without the hysteresis, merges stopped just under `max_runs`, and the kv chain ended at 505 mappings per child instead of 131.
+- Results:
+  - kv adversarial chain (`bench-depth`): the default is unchanged (51 merges, 131 maps/child, spawn 845 µs / 1.74 ms). Its p99 snapshot (~67 ms) is still a full-memory copy, because random pages across 64 MiB make every merge cover everything.
+  - CPython chain (300 levels of small statements, `py-profile`):
+
+    | compaction | snapshot | spawn | fork |
+    |---|---|---|---|
+    | off | 74 µs | 885 µs | 961 µs |
+    | default | 63 µs | 367 µs | 432 µs |
+    | `max_runs` 64 | 322 µs | 213 µs | 442 µs |
+    | `max_runs` 32 | 1.01 ms | 45 µs | 1.05 ms |
+
+    Values are medians. The p99 snapshot is ~1.3 ms everywhere (the largest merge).
+- **Decision:** keep the defaults (≤ 32 layers, ≤ 512 mappings, gap 16). For fan-out-heavy use (one snapshot, many spawns), `max_runs` 64 halves spawn time at equal fork cost. A real fix for spawn cost needs fewer `mmap`s per spawn, not compaction.
+- 2,000 property cases pass with tiered merging under the tight-compaction variants (207 s).
+
+**Branch driver (`driver.rs`) and `Runtime::run_parallel` (SPEC §5.6–5.7), on `rayon`.**
+- `run_parallel(sandboxes, f)` returns `Vec<(Sandbox, R)>` in input order.
+  - **Deviation from the spec sketch:** it doesn't return `Result`. `f` returns whatever it likes (often a `Result`), so one failed branch doesn't fail the batch.
+- `driver::search(root, Search { branching, keep, depth }, step)` is a beam search:
+  1. Each level spawns `branching` children of every survivor, in parallel, inside the pool tasks.
+  2. It runs `step`, which returns an `f64` score. Branches with an error or a NaN score are dropped.
+  3. It keeps the top `keep` (stable, so ties keep tree order) and snapshots them in parallel.
+
+  A child's RNG branch is its index under its parent, so the same path replays identically.
+- `tests/driver.rs`:
+  - `run_parallel` keeps order and isolation;
+  - the parallel search equals a sequential reference and is deterministic, including survivor memory;
+  - a search where every branch fails ends early;
+  - a CPython beam search converges on a target.
+- `Sandbox` turned out to be `Send` and `Snapshot` `Sync` already. The thread-local slot in `mem/creator.rs` is set and taken on the same thread within one instantiation, so it is safe under rayon.
+
+**Baseline B — process `fork()` (`mem/procfork.rs`, `Sandbox::process_fork_call`).**
+- Forks the host process. The child calls one export on its copy of the sandbox, writes the result to a pipe, and `_exit`s. The parent times three points: `fork()` returning, the child running, and the result.
+- Only the calling thread survives in the child. That is fine here: running guest code needs none of forkasm's helper threads, and glibc malloc has its own fork handlers. Benchmark-only.
+- Smoke number: ~0.8–1.1 ms until the child runs, for a host holding one 64 MiB sandbox (page-table copy of the whole process).
+
+**S2 — lazy userfaultfd (`mem/lazy.rs`, `Strategy::Lazy`).**
+- A spawn makes `[0, len)` plain anonymous memory and registers the whole reservation on the process-wide userfaultfd, for both `MISSING` and `WP` (same fd as write-protect tracking, `UFFD_USER_MODE_ONLY`).
+- A single handler thread fills each missing page from the snapshot the memory was spawned from. It finds the newest layer holding the page through the snapshot's plan, otherwise the base image, using `pread` + `UFFDIO_COPY` with `MODE_WP`.
+- A page that was only read is therefore write-protected and not dirty, and snapshots reuse S1's write-protect scan and layer capture unchanged. S2 always uses write-protect tracking.
+- **Untouched pages keep their spawn-time contents forever**, so a memory's spawn source stays valid after it takes snapshots of its own. Compaction therefore never remaps an S2 memory: `compose` is a no-op for it.
+- Pitfalls handled:
+  - With `UFFD_USER_MODE_ONLY`, a kernel-mode read of a missing page fails with `EFAULT`, and layers too big for a slab are written with `pwritev`. `capture_layer` therefore pre-touches an S2 memory's runs from user mode (it matters for compaction, which copies clean pages).
+  - The handler holds the registry lock from lookup to `UFFDIO_COPY`. Otherwise a stale duplicate fault could fill a page of a *new* memory mapped at a reused address with the old memory's contents.
+  - Zero pages are filled with `UFFDIO_COPY` + WP too: a plain zero page would not be write-protected, so writes to it would go unreported.
+  - `process_fork_call` refuses S2: the child process doesn't inherit the registration, so unfilled pages would read as zeros.
+- Tested everywhere S0/S1 are: `strategies()` and `layered_configs()` include S2 (default and tight compaction) when the kernel supports it, so the oracle, isolation, filesystem, CPython, driver, leak and property tests all run it.
+- Smoke numbers, quick run only (~5 iterations):
+  - fork ≈ S1 (spawn is O(1) but the snapshot is the same);
+  - each first touch costs ~12 µs (a round trip through one handler thread), so a child that writes 768 pages takes ~10 ms against ~3 ms for S1;
+  - the CPython beam search on 16 threads is ~15% slower than S1.
+
+**Captured output is now shared across forks (`wasi/output.rs`).** stdout/stderr are an append-only `Output`: full 4 KiB chunks live in an `imbl::Vector<Arc<[u8]>>`, and a clone copies at most the unsealed tail. Forking a sandbox that printed a lot is therefore no longer O(output). This closes the Week 2 "known cost".
+- `Sandbox::stdout()`/`stderr()` now return `Vec<u8>`.
+
+**Test times:** plain `cargo test` (debug) is green in ~8 min. The G2 tests take ~400 s of that, because debug-built Cranelift compiles CPython's 19 MB module slowly. `cargo test --release` takes ~2 min.
+
+**Property run with S2:** `FORKASM_PROPTEST_CASES=2000` passes all 2,000 cases with S2 among the variants (229 s).
+
+**Benchmark suite (`forkasm-cli bench-suite`, `crates/forkasm-cli/src/suite.rs`).** It writes `<name>.md` and `<name>.csv` per benchmark, with an environment header (CPU, kernel, Wasmtime version from `Cargo.lock`, rustc, build profile):
+- `strategies`: every S0/S1/S2 variant plus process fork, at 64 MiB with 128 dirty pages.
+- `size`: 1 MiB → 1 GiB at 0.78% dirty, for S0, S1 and process fork.
+- `dirty`: 1 page → 100% at 64 MiB.
+- `memory`: PSS per child from `smaps_rollup`, plus VMAs per child, at N = 1/10/100/1000, idle and with 16 dirty pages.
+- `depth`: the compaction chain.
+- `lazy`: S1 vs S2, fork against time to a first result.
+- `python`: end-to-end beam search over CPython branches (8 × keep 4 × depth 6), for S1 on 1 thread and on all threads, and S2 on all threads.
+
+`bench-fork` and `bench-depth` now print the `strategies` and `depth` tables. `--quick` smoke-tests everything in ~10 s.
+
+**Demo (`forkasm-cli demo <py.wasm> <stdlib>`).**
+1. A CPython root loads a task (sort 20,000 records) and a checker.
+2. It forks into 8 branches, one per approach: 6 correct, 1 wrong answer, 1 raising. The snapshot takes ~0.9 ms and spawning all 8 ~1.2 ms, at 7.4 MiB each.
+3. The branches run in parallel, the checker scores them, the fastest correct branch continues, and the rest are dropped.
+
+It runs end to end.
+
 ### 2026-10-11 — Week 2: VFS and WASI file calls
 - **`vfs/`** is a persistent CoW tree. Inodes live in an `imbl::OrdMap<Ino, Inode>`. Directories are `OrdMap<String, Ino>`. Files are `Vec<Option<Arc<[u8; 64 KiB]>>>`, with `None` for holes.
 - Cloning a `Vfs` is O(1). After a fork, writing one byte copies one chunk plus the B-tree path to its inode. `vfs::tests::fork_shares_until_written` checks the sharing.
@@ -40,7 +149,7 @@ Consequences:
 - **Read-only host mounts:** `SpawnOpts::mounts` copies a host tree in at root spawn and marks it read-only, so writes return `EROFS`. Contents are `Arc`-shared by every fork.
   - The copy is eager. For CPython's stdlib (Week 3) that's roughly 30 MB, read once per root.
 - **Limitations:**
-  - **Known cost:** captured stdout/stderr are plain `Vec<u8>`s in `WasiState`, copied by every snapshot. A guest that prints a lot makes forks O(output). Fix when it shows up (Week 3's CPython): chunked `Arc` segments, as in `FileData`.
+  - **Known cost (fixed in Week 3, see `wasi/output.rs`):** captured stdout/stderr were plain `Vec<u8>`s in `WasiState`, copied by every snapshot.
   - There are no symlinks, and host-mount symlinks are followed at copy time.
   - Timestamps can't be set; mtime is virtual time at modification.
   - `..` can't climb above the fd it is resolved against. This matches WASI capability rules: `/` is the root preopen.
@@ -176,8 +285,21 @@ Integration tests and criterion benches live in `crates/forkasm/{tests,benches}`
 | `criterion` (dev) | Micro-benchmarks (SPEC §8) |
 | `imbl` | Persistent maps for the VFS (SPEC §5.5's `im::OrdMap`; `imbl` is the maintained fork) |
 | `proptest` (dev) | Property tests against S0 (SPEC §7) |
+| `rayon` | Parallel branches for `run_parallel` and the branch driver (SPEC §5.7) |
 
 ## Benchmarks
+
+### Full runs still to do (Week 3 suite)
+The suite is built and smoke-tested (`--quick`), but per the user it has **not been run at full size**. To run it:
+
+```
+guests/py/build.sh
+cargo build --release -p forkasm-cli
+target/release/forkasm-cli bench-suite guests/kv/target/wasm32-wasip1/release/kv.wasm \
+    guests/py/out/py.wasm guests/py/out/lib bench-results/<date>
+```
+
+S0 at 1 GiB and the 1,000-child memory test dominate the run time. It needs ~3 GiB free RAM for S0 at 1 GiB.
 
 ### 2026-10-11 — Week 2: compaction trade-off (`forkasm-cli bench-depth … 256`)
 Same machine as below. A fork-of-fork chain of 256 levels on 64.1 MiB of memory. Each level dirties 64 random pages, snapshots, and continues in a new child. Default S1 (write-protect + pool). Median / p99:

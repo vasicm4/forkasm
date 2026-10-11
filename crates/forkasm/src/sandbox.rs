@@ -5,7 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use wasmtime::{Global, Instance, Store, Val};
 
-use crate::mem::{LayerStack, MemHandle, MemInit};
+use crate::Compaction;
+use crate::mem::{LayerStack, MemHandle, MemInit, Run};
 use crate::rewrite::START_EXPORT;
 use crate::runtime::GuestModule;
 use crate::snapshot::{MemSnap, Snapshot, SnapshotInner};
@@ -173,20 +174,23 @@ impl Sandbox {
                 || stack.segments() + runs.len() > c.max_runs
         });
         if force_compact || due {
-            // The memory currently holds exactly the snapshot's contents, so
-            // copy every page any layer (or the dirty set) covers from it.
-            let gap = compaction.unwrap_or_default().gap_pages;
-            let covered = stack.covered_runs(&runs, gap);
-            let flat_stack = if covered.is_empty() {
-                stack.base_only(size)
+            // Merge the newest layers (and the dirty set) into one. The
+            // memory currently holds exactly the snapshot's contents, so the
+            // merged layer copies every page those layers cover from it.
+            let c = compaction.unwrap_or_default();
+            let keep = if force_compact { 0 } else { merge_point(stack, &runs, &c) };
+            let covered = stack.covered_runs(keep, &runs, c.gap_pages);
+            let lower = stack.truncated(keep, size);
+            let merged = if covered.is_empty() {
+                lower
             } else {
-                let flat = Arc::new(self.mem.capture_layer(covered, pool)?);
-                stack.base_only(size).push(flat, size)
+                let layer = Arc::new(self.mem.capture_layer(covered, pool)?);
+                lower.push(layer, size)
             };
-            // Re-map ourselves too: drops private pages, the old layers'
+            // Re-map ourselves too: drops private pages, the merged layers'
             // mappings (and so their VMAs), and resets write tracking.
-            self.mem.compose(&flat_stack)?;
-            return Ok(MemSnap::Layered(flat_stack));
+            self.mem.compose(&merged)?;
+            return Ok(MemSnap::Layered(merged));
         }
         if runs.is_empty() {
             return Ok(MemSnap::Layered(stack.resized(size)));
@@ -206,8 +210,14 @@ impl Sandbox {
         self.store.data()
     }
 
-    pub fn stdout(&self) -> &[u8] {
-        &self.store.data().stdout
+    /// Everything the guest wrote to stdout.
+    pub fn stdout(&self) -> Vec<u8> {
+        self.store.data().stdout.to_vec()
+    }
+
+    /// Everything the guest wrote to stderr.
+    pub fn stderr(&self) -> Vec<u8> {
+        self.store.data().stderr.to_vec()
     }
 
     /// A copy of the whole linear memory.
@@ -269,6 +279,25 @@ impl Sandbox {
         self.globals.iter().map(|g| g.get(&mut self.store)).collect()
     }
 
+    /// Baseline B: forks the whole host process instead of the sandbox. The
+    /// child process calls `name` (which must return one integer) on its
+    /// copy of this sandbox and exits; this sandbox is untouched.
+    ///
+    /// For benchmarks. Only the calling thread survives in the child, so the
+    /// guest call must not depend on other threads (forkasm's own helper
+    /// threads are not needed to run guest code).
+    pub fn process_fork_call(&mut self, name: &str, args: &[Val]) -> Result<crate::mem::ProcessFork> {
+        if self.poisoned {
+            bail!("sandbox trapped earlier and can no longer be used");
+        }
+        // The child would not inherit the userfaultfd registration, so pages
+        // never filled would read as zeros there.
+        if self.mem.is_lazy() {
+            bail!("process fork of a lazily filled (S2) sandbox is not supported");
+        }
+        Ok(crate::mem::fork_run(|| self.call_u64(name, args).unwrap_or(u64::MAX))?)
+    }
+
     pub fn stats(&self) -> SandboxStats {
         let (layers, runs) = match &self.base {
             MemSnap::Copy(_) => (0, 0),
@@ -285,3 +314,34 @@ impl Sandbox {
         }
     }
 }
+
+/// Tiered compaction: how many of `stack`'s layers to keep when merging the
+/// rest with the new dirty `runs` into one layer.
+///
+/// Merges the fewest newest layers such that the layer below the merged one
+/// is at least [`TIER_RATIO`] times its size (so layer sizes grow
+/// geometrically towards the bottom and each page is copied O(log n) times
+/// over a long chain, instead of on every full flatten) and the resulting
+/// stack is within half the thresholds (so the next merge is some snapshots
+/// away). Falls back to flattening everything.
+fn merge_point(stack: &LayerStack, runs: &[Run], c: &Compaction) -> usize {
+    let layers = stack.layers();
+    let mut merged: usize = runs.iter().map(|r| r.len).sum();
+    for keep in (0..=layers.len()).rev() {
+        if keep < layers.len() {
+            merged += layers[keep].pages();
+        }
+        let below = if keep == 0 { usize::MAX } else { layers[keep - 1].pages() };
+        if below / TIER_RATIO < merged || keep + 1 > c.max_layers / 2 {
+            continue;
+        }
+        let top = stack.covered_runs(keep, runs, c.gap_pages);
+        if stack.segments_with_top(keep, &top) <= c.max_runs / 2 {
+            return keep;
+        }
+    }
+    0
+}
+
+/// Size ratio between adjacent layers that tiered compaction aims for.
+const TIER_RATIO: usize = 2;
