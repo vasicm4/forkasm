@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use wasmtime::{Global, Instance, Store, Val};
 
-use crate::mem::{MemHandle, MemInit};
+use crate::mem::{LayerStack, MemHandle, MemInit};
 use crate::rewrite::START_EXPORT;
 use crate::runtime::GuestModule;
 use crate::snapshot::{MemSnap, Snapshot, SnapshotInner};
@@ -118,15 +118,18 @@ impl Sandbox {
         let mem = match &self.base {
             MemSnap::Copy(_) => MemSnap::Copy(self.mem.read_all()),
             MemSnap::Layered(stack) => {
-                let runs = self.mem.dirty_runs(self.module.0.dirty_scan)?;
-                let size = self.mem.len();
-                MemSnap::Layered(if runs.is_empty() {
-                    stack.resized(size)
-                } else {
-                    let layer = Arc::new(self.mem.capture_layer(runs)?);
-                    self.mem.map_layer(&layer)?;
-                    stack.push(layer, size)
-                })
+                let stack = stack.clone();
+                match self.capture(&stack) {
+                    Ok(snap) => snap,
+                    Err(e) => {
+                        // A failure after the dirty scan may leave pages
+                        // neither captured nor still marked dirty (write-protect
+                        // scans are destructive), so the next snapshot could
+                        // silently miss them.
+                        self.poisoned = true;
+                        return Err(e.context("snapshot failed; the sandbox can no longer be used"));
+                    }
+                }
             }
         };
         self.base = mem.clone();
@@ -138,6 +141,25 @@ impl Sandbox {
             wasi: self.store.data().clone(),
             depth: self.depth,
         })))
+    }
+
+    /// S1: captures the pages dirtied since the last snapshot into a layer on
+    /// top of `stack`.
+    fn capture(&mut self, stack: &LayerStack) -> Result<MemSnap> {
+        let runs = self.mem.dirty_runs(self.module.0.dirty_tracking)?;
+        let size = self.mem.len();
+        if runs.is_empty() {
+            return Ok(MemSnap::Layered(stack.resized(size)));
+        }
+        let pool = self.module.0.pool.as_deref().expect("S1 modules have a pool");
+        let layer = Arc::new(self.mem.capture_layer(runs, pool)?);
+        // Without write-protect tracking, the captured pages would be reported
+        // again next time: swap our private copies for the shared layer. With
+        // it, the scan already re-protected them and we keep them.
+        if !self.module.tracks_writes() {
+            self.mem.map_layer(&layer)?;
+        }
+        Ok(MemSnap::Layered(stack.push(layer, size)))
     }
 
     /// The WASI state (stdout, clock, RNG, …).

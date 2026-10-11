@@ -6,16 +6,17 @@
 
 mod common;
 
-use common::{kv_wasm, runtime};
-use forkasm::{Runtime, Sandbox, Snapshot, SpawnOpts, Strategy, Val};
+use common::{kv_wasm, layered_configs, runtime};
+use forkasm::{Config, Runtime, Sandbox, Snapshot, SpawnOpts, Strategy, Val};
 
 struct Pair {
     rts: [Runtime; 2],
     roots: [Sandbox; 2],
 }
 
-fn pair() -> Pair {
-    let rts = [runtime(Strategy::Copy), runtime(Strategy::Layered)];
+/// S0 next to the S1 variant `config`.
+fn pair(config: &Config) -> Pair {
+    let rts = [runtime(Strategy::Copy), Runtime::new(config.clone()).unwrap()];
     let roots = [0, 1].map(|i| {
         let m = rts[i].load(kv_wasm()).unwrap();
         let mut sb = rts[i].spawn(&m, SpawnOpts::default()).unwrap();
@@ -61,7 +62,13 @@ fn work(sb: &mut Sandbox, seed: u64) {
 
 #[test]
 fn single_level_fork_matches() {
-    let Pair { rts, roots: [mut a, mut b] } = pair();
+    for config in layered_configs() {
+        single_level(&config);
+    }
+}
+
+fn single_level(config: &Config) {
+    let Pair { rts, roots: [mut a, mut b] } = pair(config);
     work(&mut a, 1);
     work(&mut b, 1);
     let (sa, sb) = (a.snapshot().unwrap(), b.snapshot().unwrap());
@@ -83,16 +90,27 @@ fn single_level_fork_matches() {
 
 #[test]
 fn fork_of_fork_depth_64_matches() {
-    let Pair { rts, roots: [mut a, mut b] } = pair();
+    for config in layered_configs() {
+        depth_64(&config);
+    }
+}
+
+/// Also snapshots the same sandbox repeatedly (a chain without children),
+/// which is where write-protect tracking differs most from the remap.
+fn depth_64(config: &Config) {
+    let Pair { rts, roots: [mut a, mut b] } = pair(config);
     let mut snaps: Vec<[Snapshot; 2]> = Vec::new();
     for depth in 0..64u64 {
         work(&mut a, depth);
         work(&mut b, depth);
         let s = [a.snapshot().unwrap(), b.snapshot().unwrap()];
-        // Continue in a child, so the chain is a real fork-of-fork.
-        a = rts[0].spawn_from(&s[0], depth).unwrap();
-        b = rts[1].spawn_from(&s[1], depth).unwrap();
-        assert_same(&mut a, &mut b, &format!("depth {depth}"));
+        // Mostly continue in a child, so the chain is a real fork-of-fork;
+        // every third level the parent itself continues.
+        if depth % 3 != 0 {
+            a = rts[0].spawn_from(&s[0], depth).unwrap();
+            b = rts[1].spawn_from(&s[1], depth).unwrap();
+        }
+        assert_same(&mut a, &mut b, &format!("{:?} depth {depth}", config.dirty_tracking));
         snaps.push(s);
     }
     assert_eq!(snaps.last().unwrap()[1].depth(), 64);
@@ -107,7 +125,13 @@ fn fork_of_fork_depth_64_matches() {
 
 #[test]
 fn snapshot_without_writes_adds_no_layer() {
-    let Pair { roots: [_, mut b], .. } = pair();
+    for config in layered_configs() {
+        let Pair { roots: [_, mut b], .. } = pair(&config);
+        no_writes(&mut b);
+    }
+}
+
+fn no_writes(b: &mut Sandbox) {
     let s1 = b.snapshot().unwrap();
     let s2 = b.snapshot().unwrap();
     assert_eq!(s1.layers(), s2.layers());

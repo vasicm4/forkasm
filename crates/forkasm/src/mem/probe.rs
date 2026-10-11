@@ -8,7 +8,7 @@ use std::os::fd::AsFd;
 use rustix::mm::UserfaultfdFlags;
 
 use super::mapping::write_all_at;
-use super::pagemap::{self, DirtyScan, entry_is_dirty};
+use super::pagemap::{self, DirtyTracking, entry_is_dirty};
 use super::{PAGE, Run, sys};
 
 /// Outcome of one probe.
@@ -39,6 +39,10 @@ pub fn run_all() -> Vec<Probe> {
         probe("pagemap PM_FILE on MAP_PRIVATE memfd", pm_file()),
         probe("PAGEMAP_SCAN ioctl", pagemap_scan()),
         probe("userfaultfd(UFFD_USER_MODE_ONLY)", userfaultfd()),
+        probe(
+            "uffd WP_ASYNC on shmem (DirtyTracking::WriteProtect)",
+            super::uffd::available().map(|()| "available".to_string()),
+        ),
     ]
 }
 
@@ -97,7 +101,7 @@ fn pm_file() -> Result<String, String> {
 
 fn pagemap_scan() -> Result<String, String> {
     let s = Scratch::new().map_err(|e| e.to_string())?;
-    let runs = pagemap::dirty_runs(s.base as usize, Scratch::PAGES * PAGE, DirtyScan::PagemapScan)
+    let runs = pagemap::dirty_runs(s.base as usize, Scratch::PAGES * PAGE, DirtyTracking::PagemapScan)
         .map_err(|e| e.to_string())?;
     if runs == [Run { page: 2, len: 2 }] {
         Ok(format!("dirty runs {runs:?}"))

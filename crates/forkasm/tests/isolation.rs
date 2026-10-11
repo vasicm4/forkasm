@@ -165,3 +165,37 @@ fn trap_poisons_sandbox() {
         assert!(sb.snapshot().is_err());
     }
 }
+
+#[test]
+fn children_survive_dropping_ancestors() {
+    for config in common::layered_configs()
+        .into_iter()
+        .chain([forkasm::Config { strategy: Strategy::Copy, ..Default::default() }])
+    {
+        let rt = forkasm::Runtime::new(config.clone()).unwrap();
+        let module = rt.load(kv_wasm()).unwrap();
+        let mut root = rt.spawn(&module, SpawnOpts::default()).unwrap();
+        root.call("init", &[]).unwrap();
+        let mut kid = None;
+        for level in 0..5 {
+            put(&mut root, level, level * 10);
+            let snap = root.snapshot().unwrap();
+            // Siblings come and go; their layers share slabs with ours.
+            for b in 0..3 {
+                let mut s = rt.spawn_from(&snap, b).unwrap();
+                put(&mut s, 99, 99);
+                drop(s.snapshot().unwrap());
+            }
+            kid = Some(rt.spawn_from(&snap, 0).unwrap());
+        }
+        let mut kid = kid.unwrap();
+        let expected = kid.memory();
+        drop(root);
+        // Let the pool's background thread release the dropped layers.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(kid.memory() == expected, "{:?}: memory changed", config.dirty_tracking);
+        for level in 0..5 {
+            assert_eq!(get(&mut kid, level), (level * 10) as u64);
+        }
+    }
+}

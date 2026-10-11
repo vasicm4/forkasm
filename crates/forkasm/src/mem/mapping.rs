@@ -3,14 +3,15 @@
 
 use std::io;
 use std::os::fd::AsFd;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use wasmtime::LinearMemory;
 
 use super::layer::{Layer, LayerStack};
-use super::pagemap::{self, DirtyScan};
-use super::{PAGE, Run, sys};
+use super::pagemap::{self, DirtyTracking};
+use super::pool::LayerPool;
+use super::{PAGE, Run, sys, uffd};
 
 /// One reservation: `reservation` bytes usable by the guest followed by
 /// `guard` bytes that stay `PROT_NONE`. Unmapped when the last of the
@@ -21,6 +22,12 @@ struct Mapping {
     guard: usize,
     /// Bytes currently accessible (`PROT_READ | PROT_WRITE`) from `base`.
     accessible: AtomicUsize,
+    /// Registered for userfaultfd write tracking.
+    tracked: AtomicBool,
+    /// Every layer currently mapped. Layer pages live in shared slabs that are
+    /// hole-punched when the layer is dropped, so the mapping must keep them
+    /// alive (unlike a plain file, which the mapping itself would keep open).
+    pinned: Mutex<Vec<Arc<Layer>>>,
 }
 
 // SAFETY: `Mapping` only stores the address of a mapping it owns. Access to the
@@ -53,30 +60,45 @@ impl Mapping {
         // base file is at least `reservation` bytes long, so no page we map
         // lies past its end.
         unsafe { sys::map_file_fixed(self.base, len, stack.base().fd(), 0, true)? };
+        self.pinned().clear();
         for layer in stack.layers() {
             self.map_layer(layer)?;
         }
         self.accessible.store(len, Ordering::Release);
-        Ok(())
+        self.register_tracking()
     }
 
-    fn map_layer(&self, layer: &Layer) -> io::Result<()> {
-        for run in layer.runs() {
+    fn pinned(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Layer>>> {
+        self.pinned.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn map_layer(&self, layer: &Arc<Layer>) -> io::Result<()> {
+        self.pinned().push(layer.clone());
+        for (run, file_off) in layer.mapped_runs() {
             let end = run.byte_offset() + run.byte_len();
             assert!(end <= layer.byte_size() && end <= self.reservation);
-            // SAFETY: the run lies inside our reservation and inside the layer
-            // file (checked above), which is never truncated. Callers only map
-            // layers no larger than the memory being composed. The sandbox is
-            // quiescent.
+            // SAFETY: the run lies inside our reservation (checked above) and
+            // its pages inside the layer's storage, which is never truncated
+            // while the layer lives. Callers only map layers no larger than the
+            // memory being composed. The sandbox is quiescent.
             unsafe {
                 sys::map_file_fixed(
                     self.base.add(run.byte_offset()),
                     run.byte_len(),
                     layer.fd(),
-                    run.byte_offset(),
+                    file_off,
                     true,
                 )?
             };
+        }
+        Ok(())
+    }
+
+    /// Registers the whole reservation for write tracking, if enabled. Needed
+    /// again after every remap, since a new mapping starts unregistered.
+    fn register_tracking(&self) -> io::Result<()> {
+        if self.tracked.load(Ordering::Acquire) {
+            uffd::register(self.base as usize, self.reservation)?;
         }
         Ok(())
     }
@@ -107,7 +129,14 @@ impl Region {
         maximum: Option<usize>,
     ) -> io::Result<(Region, MemHandle)> {
         let base = sys::reserve(reservation + guard)?;
-        let map = Arc::new(Mapping { base, reservation, guard, accessible: AtomicUsize::new(0) });
+        let map = Arc::new(Mapping {
+            base,
+            reservation,
+            guard,
+            accessible: AtomicUsize::new(0),
+            tracked: AtomicBool::new(false),
+            pinned: Mutex::new(Vec::new()),
+        });
         Ok((Region { map: map.clone(), maximum }, MemHandle(map)))
     }
 }
@@ -172,9 +201,11 @@ impl MemHandle {
     }
 
     /// Maps the base image over the whole reservation (inaccessible), then
-    /// `stack` over `[0, len)`.
-    pub(super) fn init_layers(&self, stack: &LayerStack, len: usize) -> io::Result<()> {
+    /// `stack` over `[0, len)`. With `track_writes`, the memory is registered
+    /// for [`DirtyTracking::WriteProtect`].
+    pub(super) fn init_layers(&self, stack: &LayerStack, len: usize, track_writes: bool) -> io::Result<()> {
         assert!(self.len() == 0 && stack.base().size() >= self.0.reservation);
+        self.0.tracked.store(track_writes, Ordering::Release);
         // SAFETY: the reservation is ours and still entirely `PROT_NONE`; the
         // base file covers all of it.
         unsafe { sys::map_file_fixed(self.0.base, self.0.reservation, stack.base().fd(), 0, false)? };
@@ -189,7 +220,7 @@ impl MemHandle {
 
     /// Maps `layer`'s runs over themselves, dropping the private copies of
     /// exactly those pages. Used by a parent right after it snapshots.
-    pub(crate) fn map_layer(&self, layer: &Layer) -> io::Result<()> {
+    pub(crate) fn map_layer(&self, layer: &Arc<Layer>) -> io::Result<()> {
         self.0.map_layer(layer)
     }
 
@@ -208,21 +239,21 @@ impl MemHandle {
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.0.base.add(off), data.len()) };
     }
 
-    /// Pages written since the memory was last composed from layers.
-    pub(crate) fn dirty_runs(&self, scan: DirtyScan) -> io::Result<Vec<Run>> {
-        pagemap::dirty_runs(self.0.base as usize, self.len(), scan)
+    /// Pages written since the last snapshot: since the memory was last
+    /// composed from layers, or (with `WriteProtect`) since the last scan.
+    pub(crate) fn dirty_runs(&self, tracking: DirtyTracking) -> io::Result<Vec<Run>> {
+        pagemap::dirty_runs(self.0.base as usize, self.len(), tracking)
     }
 
-    /// Copies `runs` of memory into a new layer file.
-    pub(crate) fn capture_layer(&self, runs: Vec<Run>) -> io::Result<Layer> {
-        let size = self.len();
-        let fd = sys::memfd("forkasm-layer", size)?;
-        for run in &runs {
-            // SAFETY: the sandbox is quiescent; `bytes` bounds-checks the run.
-            let src = unsafe { self.0.bytes(run.byte_offset(), run.byte_len()) };
-            write_all_at(fd.as_fd(), src, run.byte_offset())?;
-        }
-        Ok(Layer::new(fd, runs, size))
+    /// Copies `runs` of memory into a new layer.
+    pub(crate) fn capture_layer(&self, runs: Vec<Run>, pool: &LayerPool) -> io::Result<Layer> {
+        // SAFETY: the sandbox is quiescent and stays so while the slices live
+        // (we hold `&self` and the sandbox is borrowed by the caller); `bytes`
+        // bounds-checks every run.
+        let chunks: Vec<&[u8]> =
+            runs.iter().map(|r| unsafe { self.0.bytes(r.byte_offset(), r.byte_len()) }).collect();
+        let storage = pool.store(&chunks)?;
+        Ok(Layer::new(storage, runs, self.len()))
     }
 }
 

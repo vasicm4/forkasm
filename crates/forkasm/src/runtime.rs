@@ -6,7 +6,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use wasmtime::{Engine, InstancePre, Linker, Module};
 
-use crate::mem::{BaseImage, DirtyScan, ForkasmMemoryCreator, LayerStack, MemInit, PAGE};
+use crate::mem::{
+    BaseImage, DirtyTracking, ForkasmMemoryCreator, LayerPool, LayerStack, MemInit, PAGE, PoolConfig,
+};
 use crate::rewrite::{self, MemImage};
 use crate::sandbox::Sandbox;
 use crate::snapshot::{MemSnap, Snapshot};
@@ -26,7 +28,10 @@ pub enum Strategy {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub strategy: Strategy,
-    pub dirty_scan: DirtyScan,
+    /// How S1 finds dirty pages; `Auto` picks the best the kernel supports.
+    pub dirty_tracking: DirtyTracking,
+    /// Pre-allocated layer storage for S1; `None` allocates on each snapshot.
+    pub layer_pool: Option<PoolConfig>,
     /// Bytes of address space reserved per memory (≥ the largest memory).
     pub memory_reservation: u64,
     /// Unmapped bytes after each reservation, letting Wasmtime elide bounds
@@ -40,7 +45,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             strategy: Strategy::default(),
-            dirty_scan: DirtyScan::default(),
+            dirty_tracking: DirtyTracking::default(),
+            layer_pool: Some(PoolConfig::default()),
             memory_reservation: 1 << 32,
             memory_guard: 32 << 20,
             real_time: false,
@@ -51,10 +57,15 @@ impl Default for Config {
 pub struct Runtime {
     engine: Engine,
     config: Config,
+    pool: Option<Arc<LayerPool>>,
 }
 
 impl Runtime {
-    pub fn new(config: Config) -> Result<Runtime> {
+    pub fn new(mut config: Config) -> Result<Runtime> {
+        if config.dirty_tracking == DirtyTracking::WriteProtect {
+            crate::mem::write_protect_available().map_err(anyhow::Error::msg)?;
+        }
+        config.dirty_tracking = config.dirty_tracking.resolve();
         anyhow::ensure!(
             config.memory_reservation.is_multiple_of(PAGE as u64)
                 && config.memory_guard.is_multiple_of(PAGE as u64),
@@ -70,11 +81,34 @@ impl Runtime {
             .memory_reservation_for_growth(0)
             .wasm_multi_memory(false)
             .wasm_memory64(false);
-        Ok(Runtime { engine: Engine::new(&wt)?, config })
+        let pool = match (config.strategy, config.layer_pool) {
+            (Strategy::Layered, Some(pool)) => Some(pool),
+            // A pool with nothing ready: every slab is allocated on demand.
+            (Strategy::Layered, None) => Some(PoolConfig { ready_slabs: 0, ..PoolConfig::default() }),
+            (Strategy::Copy, _) => None,
+        };
+        let pool = pool.map(LayerPool::new).transpose()?.map(Arc::new);
+        Ok(Runtime { engine: Engine::new(&wt)?, config, pool })
     }
 
+    /// The effective configuration (`Auto` settings resolved).
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// How many times a snapshot found no pre-allocated slab ready and had to
+    /// allocate one on the spot.
+    pub fn layer_pool_misses(&self) -> usize {
+        self.pool.as_ref().map_or(0, |p| p.misses())
+    }
+
+    /// Blocks until the layer pool has all its slabs ready, so the next
+    /// snapshots don't pay for allocation (benchmarks, latency-critical forks).
+    pub fn warm_up(&self) -> Result<()> {
+        if let Some(pool) = &self.pool {
+            pool.fill()?;
+        }
+        Ok(())
     }
 
     pub fn load(&self, path: impl AsRef<Path>) -> Result<GuestModule> {
@@ -104,7 +138,8 @@ impl Runtime {
             initial,
             globals: rw.globals,
             has_start: rw.has_start,
-            dirty_scan: self.config.dirty_scan,
+            dirty_tracking: self.config.dirty_tracking,
+            pool: self.pool.clone(),
         })))
     }
 
@@ -117,7 +152,7 @@ impl Runtime {
             rng: Rng::new(opts.seed),
             ..WasiState::default()
         };
-        let init = module.0.initial.to_init();
+        let init = module.0.initial.to_init(module.tracks_writes());
         let mut sb = Sandbox::instantiate(module.clone(), init, wasi, None)?;
         sb.run_initialisers()?;
         Ok(sb)
@@ -148,20 +183,28 @@ pub struct SpawnOpts {
 #[derive(Clone)]
 pub struct GuestModule(pub(crate) Arc<ModuleInner>);
 
+impl GuestModule {
+    pub(crate) fn tracks_writes(&self) -> bool {
+        self.0.dirty_tracking == DirtyTracking::WriteProtect
+    }
+}
+
 pub(crate) struct ModuleInner {
     pub(crate) pre: InstancePre<WasiState>,
     /// The memory a root sandbox starts from.
     pub(crate) initial: MemSnap,
     pub(crate) globals: Vec<String>,
     pub(crate) has_start: bool,
-    pub(crate) dirty_scan: DirtyScan,
+    pub(crate) dirty_tracking: DirtyTracking,
+    /// Layer storage (S1 only).
+    pub(crate) pool: Option<Arc<LayerPool>>,
 }
 
 impl MemSnap {
-    pub(crate) fn to_init(&self) -> MemInit {
+    pub(crate) fn to_init(&self, track_writes: bool) -> MemInit {
         match self {
             MemSnap::Copy(bytes) => MemInit::Copy(bytes.clone()),
-            MemSnap::Layered(stack) => MemInit::Layers(stack.clone()),
+            MemSnap::Layered(stack) => MemInit::Layers(stack.clone(), track_writes),
         }
     }
 }

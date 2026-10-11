@@ -3,7 +3,8 @@
 //! A sandbox's memory is a `MAP_PRIVATE` mapping of layer files. A page the
 //! guest has written since the last compose has been copied into an anonymous
 //! page, so it is *dirty* exactly when it is present (or swapped) and not
-//! file-backed.
+//! file-backed. With [`DirtyTracking::WriteProtect`] it must additionally have
+//! been written since the previous scan (see [`super::uffd`]).
 
 use std::fs::File;
 use std::io;
@@ -13,15 +14,34 @@ use std::sync::Mutex;
 
 use super::{PAGE, Run, push_page, push_run};
 
-/// How to find dirty pages.
+/// How to find the pages a sandbox dirtied since its last snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DirtyScan {
-    /// Read one 64-bit entry per page from `/proc/self/pagemap`.
+pub enum DirtyTracking {
+    /// [`WriteProtect`](Self::WriteProtect) when the kernel supports it,
+    /// otherwise [`PagemapScan`](Self::PagemapScan).
+    #[default]
+    Auto,
+    /// Read one 64-bit entry per page from `/proc/self/pagemap`. The parent
+    /// remaps the captured pages onto the new layer after each snapshot.
     Pagemap,
     /// The `PAGEMAP_SCAN` ioctl (Linux ≥ 6.7): the kernel returns only the
-    /// matching ranges.
-    #[default]
+    /// matching ranges. The parent remaps as with `Pagemap`.
     PagemapScan,
+    /// `PAGEMAP_SCAN` plus userfaultfd asynchronous write-protection: the scan
+    /// re-protects what it reports, so the parent keeps its private pages and
+    /// needs no remap.
+    WriteProtect,
+}
+
+impl DirtyTracking {
+    /// Replaces `Auto` with the best mode this kernel supports.
+    pub fn resolve(self) -> DirtyTracking {
+        match self {
+            DirtyTracking::Auto if super::uffd::available().is_ok() => DirtyTracking::WriteProtect,
+            DirtyTracking::Auto => DirtyTracking::PagemapScan,
+            other => other,
+        }
+    }
 }
 
 const PM_PRESENT: u64 = 1 << 63;
@@ -46,11 +66,13 @@ pub(super) fn with_pagemap<R>(f: impl FnOnce(&File) -> io::Result<R>) -> io::Res
 }
 
 /// Dirty runs in `[addr, addr + len)`, as page indices relative to `addr`.
-pub(super) fn dirty_runs(addr: usize, len: usize, scan: DirtyScan) -> io::Result<Vec<Run>> {
+pub(super) fn dirty_runs(addr: usize, len: usize, tracking: DirtyTracking) -> io::Result<Vec<Run>> {
     assert!(addr.is_multiple_of(PAGE) && len.is_multiple_of(PAGE));
-    match scan {
-        DirtyScan::Pagemap => read_pagemap(addr, len),
-        DirtyScan::PagemapScan => pagemap_scan(addr, len),
+    match tracking.resolve() {
+        DirtyTracking::Pagemap => read_pagemap(addr, len),
+        DirtyTracking::PagemapScan => pagemap_scan(addr, len, false),
+        DirtyTracking::WriteProtect => pagemap_scan(addr, len, true),
+        DirtyTracking::Auto => unreachable!("resolved above"),
     }
 }
 
@@ -84,6 +106,9 @@ fn read_pagemap(addr: usize, len: usize) -> io::Result<Vec<Run>> {
 }
 
 // From <linux/fs.h>.
+const PM_SCAN_WP_MATCHING: u64 = 1 << 0;
+const PM_SCAN_CHECK_WPASYNC: u64 = 1 << 1;
+const PAGE_IS_WRITTEN: u64 = 1 << 1;
 const PAGE_IS_FILE: u64 = 1 << 2;
 const PAGE_IS_PRESENT: u64 = 1 << 3;
 const PAGE_IS_SWAPPED: u64 = 1 << 4;
@@ -117,7 +142,11 @@ struct PageRegion {
 const PAGEMAP_SCAN: libc::c_ulong =
     (3 << 30) | ((size_of::<PmScanArg>() as libc::c_ulong) << 16) | ((b'f' as libc::c_ulong) << 8) | 16;
 
-fn pagemap_scan(addr: usize, len: usize) -> io::Result<Vec<Run>> {
+/// With `write_protect`, only pages written since the previous scan match, and
+/// the kernel write-protects every page it reports.
+fn pagemap_scan(addr: usize, len: usize, write_protect: bool) -> io::Result<Vec<Run>> {
+    let (flags, written) =
+        if write_protect { (PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC, PAGE_IS_WRITTEN) } else { (0, 0) };
     let mut runs = Vec::new();
     let mut regions = vec![PageRegion::default(); 256];
     let end = (addr + len) as u64;
@@ -126,13 +155,15 @@ fn pagemap_scan(addr: usize, len: usize) -> io::Result<Vec<Run>> {
         while start < end {
             let mut arg = PmScanArg {
                 size: size_of::<PmScanArg>() as u64,
+                flags,
                 start,
                 end,
                 vec: regions.as_mut_ptr() as u64,
                 vec_len: regions.len() as u64,
-                // Match pages that are (present or swapped) and not file-backed.
+                // Match pages that are (present or swapped), not file-backed,
+                // and (with write-protect) written since the last scan.
                 category_inverted: PAGE_IS_FILE,
-                category_mask: PAGE_IS_FILE,
+                category_mask: PAGE_IS_FILE | written,
                 category_anyof_mask: PAGE_IS_PRESENT | PAGE_IS_SWAPPED,
                 return_mask: PAGE_IS_FILE,
                 ..Default::default()

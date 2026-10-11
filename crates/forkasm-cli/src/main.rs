@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use forkasm::mem::DirtyScan;
+use forkasm::mem::DirtyTracking;
 use forkasm::{Config, Runtime, Sandbox, Snapshot, SpawnOpts, Strategy, Val};
 
 fn main() -> Result<()> {
@@ -47,19 +47,31 @@ fn bench_fork(path: &str, iters: usize) -> Result<()> {
         "{:<18} {:>9} {:>22} {:>22} {:>22}",
         "strategy", "memory", "snapshot med / p99", "spawn med / p99", "fork med / p99"
     );
+    let no_pool = None;
+    let pool = Some(forkasm::mem::PoolConfig::default());
     let cases = [
-        ("S0", Strategy::Copy, DirtyScan::PagemapScan),
-        ("S1-pagemap", Strategy::Layered, DirtyScan::Pagemap),
-        ("S1-pagemap_scan", Strategy::Layered, DirtyScan::PagemapScan),
+        ("S0", Strategy::Copy, DirtyTracking::PagemapScan, no_pool),
+        ("S1 pagemap", Strategy::Layered, DirtyTracking::Pagemap, no_pool),
+        ("S1 scan", Strategy::Layered, DirtyTracking::PagemapScan, no_pool),
+        ("S1 scan+pool", Strategy::Layered, DirtyTracking::PagemapScan, pool),
+        ("S1 wp", Strategy::Layered, DirtyTracking::WriteProtect, no_pool),
+        ("S1 wp+pool", Strategy::Layered, DirtyTracking::WriteProtect, pool),
     ];
-    for (name, strategy, dirty_scan) in cases {
-        let rt = Runtime::new(Config { strategy, dirty_scan, ..Config::default() })?;
+    for (name, strategy, dirty_tracking, layer_pool) in cases {
+        let rt = match Runtime::new(Config { strategy, dirty_tracking, layer_pool, ..Config::default() }) {
+            Ok(rt) => rt,
+            Err(e) => {
+                println!("{name:<18} skipped: {e}");
+                continue;
+            }
+        };
         let module = rt.load(path)?;
         let mut root = rt.spawn(&module, SpawnOpts::default())?;
         root.call("init", &[])?;
         root.call("buf_init", &[Val::I32(BUF_PAGES)])?;
         root.call("touch_pages", &[Val::I32(0), Val::I32(BUF_PAGES), Val::I32(1)])?;
         let base = root.snapshot()?;
+        rt.warm_up()?;
         let n = if strategy == Strategy::Copy { iters.min(100) } else { iters };
         let (mut snap_t, mut spawn_t, mut fork_t) = (Vec::new(), Vec::new(), Vec::new());
         for i in 0..n as u64 {
@@ -74,13 +86,20 @@ fn bench_fork(path: &str, iters: usize) -> Result<()> {
             fork_t.push(t2 - t0);
             drop((child, s, parent));
         }
+        let mut notes = Vec::new();
+        if n < iters {
+            notes.push(format!("{n} iterations"));
+        }
+        if rt.layer_pool_misses() > 0 && layer_pool.is_some() {
+            notes.push(format!("{} pool misses", rt.layer_pool_misses()));
+        }
         println!(
             "{name:<18} {:>5.1} MiB {:>22} {:>22} {:>22}{}",
             base.memory_size() as f64 / MIB as f64,
             stats(&mut snap_t),
             stats(&mut spawn_t),
             stats(&mut fork_t),
-            if n < iters { format!("  ({n} iterations)") } else { String::new() },
+            if notes.is_empty() { String::new() } else { format!("  ({})", notes.join(", ")) },
         );
     }
     Ok(())

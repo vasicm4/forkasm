@@ -37,7 +37,7 @@ impl Snapshot {
         let s = &self.0;
         let mut wasi = s.wasi.clone();
         wasi.rng = wasi.rng.fork(branch);
-        Sandbox::instantiate(s.module.clone(), s.mem.to_init(), wasi, Some(self))
+        Sandbox::instantiate(s.module.clone(), s.mem.to_init(s.module.tracks_writes()), wasi, Some(self))
     }
 
     /// Number of snapshots between this one and its root sandbox.

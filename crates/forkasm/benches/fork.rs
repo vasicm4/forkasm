@@ -10,7 +10,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use forkasm::mem::DirtyScan;
+use forkasm::mem::{DirtyTracking, PoolConfig};
 use forkasm::{Config, Runtime, Sandbox, Snapshot, SpawnOpts, Strategy, Val};
 
 const MIB: usize = 1 << 20;
@@ -20,16 +20,21 @@ const BUF_PAGES: i32 = (63 * MIB / 4096) as i32;
 const DIRTY: i32 = 128;
 
 /// A clean snapshot of a kv guest whose 64 MiB memory is fully populated.
-fn base(strategy: Strategy, dirty_scan: DirtyScan) -> (Runtime, Snapshot) {
-    let rt = Runtime::new(Config { strategy, dirty_scan, ..Config::default() }).unwrap();
+fn base(
+    strategy: Strategy,
+    dirty_tracking: DirtyTracking,
+    layer_pool: Option<PoolConfig>,
+) -> (Runtime, Snapshot) {
+    let rt = Runtime::new(Config { strategy, dirty_tracking, layer_pool, ..Config::default() }).unwrap();
     let module = rt.load(common::kv_wasm()).unwrap();
     let mut root = rt.spawn(&module, SpawnOpts::default()).unwrap();
     root.call("init", &[]).unwrap();
     root.call("buf_init", &[Val::I32(BUF_PAGES)]).unwrap();
     root.call("touch_pages", &[Val::I32(0), Val::I32(BUF_PAGES), Val::I32(1)]).unwrap();
     let snap = root.snapshot().unwrap();
+    rt.warm_up().unwrap();
     let mb = snap.memory_size() as f64 / MIB as f64;
-    eprintln!("{strategy:?}/{dirty_scan:?}: memory {mb:.1} MiB");
+    eprintln!("{strategy:?}/{dirty_tracking:?}: memory {mb:.1} MiB");
     (rt, snap)
 }
 
@@ -43,13 +48,19 @@ fn dirty_parent(rt: &Runtime, snap: &Snapshot, i: u64) -> Sandbox {
 fn fork_latency(c: &mut Criterion) {
     let mut g = c.benchmark_group("fork_64MiB_128_dirty_pages");
     g.sample_size(100).measurement_time(Duration::from_secs(10));
-    let cases = [
-        ("S0", Strategy::Copy, DirtyScan::PagemapScan),
-        ("S1-pagemap", Strategy::Layered, DirtyScan::Pagemap),
-        ("S1-pagemap_scan", Strategy::Layered, DirtyScan::PagemapScan),
+    let pool = Some(PoolConfig::default());
+    let mut cases = vec![
+        ("S0", Strategy::Copy, DirtyTracking::PagemapScan, None),
+        ("S1-pagemap", Strategy::Layered, DirtyTracking::Pagemap, None),
+        ("S1-scan", Strategy::Layered, DirtyTracking::PagemapScan, None),
+        ("S1-scan+pool", Strategy::Layered, DirtyTracking::PagemapScan, pool),
     ];
-    for (name, strategy, scan) in cases {
-        let (rt, snap) = base(strategy, scan);
+    if forkasm::mem::write_protect_available().is_ok() {
+        cases.push(("S1-wp", Strategy::Layered, DirtyTracking::WriteProtect, None));
+        cases.push(("S1-wp+pool", Strategy::Layered, DirtyTracking::WriteProtect, pool));
+    }
+    for (name, strategy, tracking, layer_pool) in cases {
+        let (rt, snap) = base(strategy, tracking, layer_pool);
         g.bench_function(BenchmarkId::new("snapshot+spawn", name), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;

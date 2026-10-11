@@ -19,8 +19,9 @@ pub(crate) enum MemInit {
     Zero,
     /// A private copy of these bytes (strategy S0).
     Copy(Arc<[u8]>),
-    /// A composite CoW mapping of these layers (strategy S1).
-    Layers(LayerStack),
+    /// A composite CoW mapping of these layers (strategy S1), optionally
+    /// registered for write tracking.
+    Layers(LayerStack, bool),
 }
 
 impl MemInit {
@@ -28,7 +29,7 @@ impl MemInit {
         match self {
             MemInit::Zero => 0,
             MemInit::Copy(bytes) => bytes.len(),
-            MemInit::Layers(stack) => stack.byte_size(),
+            MemInit::Layers(stack, _) => stack.byte_size(),
         }
     }
 }
@@ -86,7 +87,7 @@ unsafe impl MemoryCreator for ForkasmMemoryCreator {
         let init_result = match &init {
             MemInit::Zero => handle.init_zero(size),
             MemInit::Copy(bytes) => handle.init_zero(size).map(|()| handle.write(0, bytes)),
-            MemInit::Layers(stack) => handle.init_layers(stack, size),
+            MemInit::Layers(stack, track) => handle.init_layers(stack, size, *track),
         };
         init_result.map_err(|e| format!("initialising memory: {e}"))?;
         CREATED.with_borrow_mut(|c| *c = Some(handle));

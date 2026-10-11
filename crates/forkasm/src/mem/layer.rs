@@ -5,6 +5,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
 use super::mapping::write_all_at;
+use super::pool::Storage;
 use super::{PAGE, Run, sys};
 
 /// The bottom layer: the module's initial memory image, sized to cover the
@@ -36,26 +37,36 @@ impl BaseImage {
     }
 }
 
-/// The pages a sandbox dirtied between two snapshots, stored at their own
-/// offsets in a sparse memfd.
+/// The pages a sandbox dirtied between two snapshots, stored packed (in run
+/// order) in pool storage.
 pub(crate) struct Layer {
-    fd: OwnedFd,
+    storage: Storage,
     runs: Vec<Run>,
     /// Memory size when the layer was captured.
     byte_size: usize,
 }
 
 impl Layer {
-    pub(super) fn new(fd: OwnedFd, runs: Vec<Run>, byte_size: usize) -> Layer {
-        Layer { fd, runs, byte_size }
+    pub(super) fn new(storage: Storage, runs: Vec<Run>, byte_size: usize) -> Layer {
+        debug_assert_eq!(storage.len, runs.iter().map(Run::byte_len).sum::<usize>());
+        Layer { storage, runs, byte_size }
     }
 
     pub(crate) fn fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
+        self.storage.fd()
     }
 
     pub(crate) fn runs(&self) -> &[Run] {
         &self.runs
+    }
+
+    /// Each run with the byte offset of its pages in [`Self::fd`].
+    pub(crate) fn mapped_runs(&self) -> impl Iterator<Item = (Run, usize)> + '_ {
+        self.runs.iter().scan(self.storage.offset, |off, &run| {
+            let at = *off;
+            *off += run.byte_len();
+            Some((run, at))
+        })
     }
 
     pub(crate) fn byte_size(&self) -> usize {
