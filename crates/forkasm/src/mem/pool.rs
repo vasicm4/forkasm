@@ -10,13 +10,15 @@
 //!
 //! A dropped layer's pages are released by punching a hole in its slab on the
 //! background thread; the slab itself is closed when its last layer goes.
+//! One background thread serves every pool in the process (a thread per
+//! runtime would also cost a malloc arena each).
 //! Layers larger than a slab get a memfd of their own.
 
 use std::io::{self, IoSlice};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use rustix::fs::{FallocateFlags, fallocate};
 
@@ -44,7 +46,6 @@ pub(crate) struct Slab {
     fd: OwnedFd,
     /// Shared mapping used to fill it (pre-allocated slabs only).
     map: Option<SharedMap>,
-    worker: Sender<Job>,
 }
 
 /// A slab prepared by the background thread.
@@ -72,14 +73,14 @@ impl Drop for Storage {
         // Other layers still use the slab: give our pages back. Otherwise the
         // slab closes with us and the kernel frees everything.
         if Arc::strong_count(&self.slab) > 1 && self.len > 0 {
-            let _ = self.slab.worker.send(Job::Punch(self.slab.clone(), self.offset, self.len));
+            send(Job::Punch(self.slab.clone(), self.offset, self.len));
         }
     }
 }
 
 enum Job {
-    /// Top the ready list up to `ready_slabs`.
-    Refill,
+    /// Top a pool's ready list up to its `ready_slabs`.
+    Refill(Weak<Shared>),
     /// Release `[offset, offset + len)` of a slab.
     Punch(Arc<Slab>, usize, usize),
 }
@@ -99,7 +100,6 @@ struct Current {
 pub(crate) struct LayerPool {
     shared: Arc<Shared>,
     current: Mutex<Option<Current>>,
-    worker: Sender<Job>,
     /// Slabs a snapshot had to create itself because none was ready.
     misses: AtomicUsize,
 }
@@ -109,11 +109,13 @@ impl LayerPool {
     pub(crate) fn new(config: PoolConfig) -> io::Result<LayerPool> {
         assert!(config.slab_bytes.is_multiple_of(PAGE) && config.slab_bytes > 0);
         let shared = Arc::new(Shared { config, ready: Mutex::new(Vec::new()) });
-        let (worker, jobs) = channel();
-        let weak = Arc::downgrade(&shared);
-        std::thread::Builder::new().name("forkasm-layer-pool".into()).spawn(move || work(weak, jobs))?;
-        let _ = worker.send(Job::Refill);
-        Ok(LayerPool { shared, current: Mutex::new(None), worker, misses: AtomicUsize::new(0) })
+        let pool = LayerPool { shared, current: Mutex::new(None), misses: AtomicUsize::new(0) };
+        pool.refill();
+        Ok(pool)
+    }
+
+    fn refill(&self) {
+        send(Job::Refill(Arc::downgrade(&self.shared)));
     }
 
     /// Blocks until the ready list is full (for benchmarks and tests).
@@ -141,7 +143,7 @@ impl LayerPool {
         let storage = if len > self.shared.config.slab_bytes {
             // Too large for a slab: a dedicated, exactly-sized memfd.
             let fd = sys::memfd("forkasm-layer", len)?;
-            Storage { slab: Arc::new(Slab { fd, map: None, worker: self.worker.clone() }), offset: 0, len }
+            Storage { slab: Arc::new(Slab { fd, map: None }), offset: 0, len }
         } else {
             self.carve(len)?
         };
@@ -168,7 +170,7 @@ impl LayerPool {
                 && old.used < slab_bytes
             {
                 // Release the unused, pre-allocated tail.
-                let _ = self.worker.send(Job::Punch(old.slab, old.used, slab_bytes - old.used));
+                send(Job::Punch(old.slab, old.used, slab_bytes - old.used));
             }
             let (fd, map) = match self.lock_ready().pop() {
                 Some(p) => (p.fd, Some(p.map)),
@@ -178,9 +180,8 @@ impl LayerPool {
                     (sys::memfd("forkasm-slab", slab_bytes)?, None)
                 }
             };
-            let _ = self.worker.send(Job::Refill);
-            *current =
-                Some(Current { slab: Arc::new(Slab { fd, map, worker: self.worker.clone() }), used: 0 });
+            self.refill();
+            *current = Some(Current { slab: Arc::new(Slab { fd, map }), used: 0 });
         }
         let c = current.as_mut().expect("set above");
         let storage = Storage { slab: c.slab.clone(), offset: c.used, len };
@@ -196,10 +197,25 @@ fn prepare_slab(size: usize) -> io::Result<Prepared> {
     Ok(Prepared { fd, map })
 }
 
-fn work(shared: Weak<Shared>, jobs: Receiver<Job>) {
+/// Queues a job for the process-wide background thread, starting it on first
+/// use. If it cannot be started, jobs are dropped: pools then never refill
+/// (snapshots allocate on demand) and dropped layers are freed with their slab.
+fn send(job: Job) {
+    static WORKER: OnceLock<Option<Mutex<Sender<Job>>>> = OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (tx, rx) = channel();
+        let started = std::thread::Builder::new().name("forkasm-layer-pool".into()).spawn(move || work(rx));
+        started.ok().map(|_| Mutex::new(tx))
+    });
+    if let Some(tx) = worker {
+        let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+    }
+}
+
+fn work(jobs: Receiver<Job>) {
     while let Ok(job) = jobs.recv() {
         match job {
-            Job::Refill => {
+            Job::Refill(shared) => {
                 let Some(shared) = shared.upgrade() else { continue };
                 loop {
                     let missing = {
