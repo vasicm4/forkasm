@@ -86,7 +86,7 @@ unsafe impl MemoryCreator for ForkasmMemoryCreator {
             .map_err(|e| format!("reserving memory: {e}"))?;
         let init_result = match &init {
             MemInit::Zero => handle.init_zero(size),
-            MemInit::Copy(bytes) => handle.init_zero(size).map(|()| handle.write(0, bytes)),
+            MemInit::Copy(bytes) => handle.init_zero(size).and_then(|()| handle.fill(bytes)),
             MemInit::Layers(stack, track) => handle.init_layers(stack, size, *track),
         };
         init_result.map_err(|e| format!("initialising memory: {e}"))?;

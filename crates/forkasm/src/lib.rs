@@ -16,7 +16,7 @@ mod sandbox;
 mod snapshot;
 pub mod wasi;
 
-pub use runtime::{Config, GuestModule, Runtime, SpawnOpts, Strategy};
+pub use runtime::{Compaction, Config, GuestModule, Runtime, SpawnOpts, Strategy};
 pub use sandbox::{Sandbox, SandboxStats};
 pub use snapshot::Snapshot;
 pub use wasmtime::Val;

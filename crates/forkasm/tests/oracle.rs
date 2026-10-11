@@ -6,7 +6,9 @@
 
 mod common;
 
-use common::{kv_wasm, layered_configs, runtime};
+use common::{assert_same, kv_wasm, layered_configs, runtime, work};
+
+const BUF: i32 = 1024;
 use forkasm::{Config, Runtime, Sandbox, Snapshot, SpawnOpts, Strategy, Val};
 
 struct Pair {
@@ -21,43 +23,10 @@ fn pair(config: &Config) -> Pair {
         let m = rts[i].load(kv_wasm()).unwrap();
         let mut sb = rts[i].spawn(&m, SpawnOpts::default()).unwrap();
         sb.call("init", &[]).unwrap();
-        sb.call("buf_init", &[Val::I32(1024)]).unwrap();
+        sb.call("buf_init", &[Val::I32(BUF)]).unwrap();
         sb
     });
     Pair { rts, roots }
-}
-
-fn bits(v: &Val) -> u128 {
-    match v {
-        Val::I32(x) => *x as u32 as u128,
-        Val::I64(x) => *x as u64 as u128,
-        Val::F32(x) => *x as u128,
-        Val::F64(x) => *x as u128,
-        Val::V128(x) => x.as_u128(),
-        other => panic!("unexpected global {other:?}"),
-    }
-}
-
-fn assert_same(s0: &mut Sandbox, s1: &mut Sandbox, what: &str) {
-    assert_eq!(s0.stats().memory_bytes, s1.stats().memory_bytes, "{what}: memory size");
-    assert!(s0.memory() == s1.memory(), "{what}: memory bytes differ");
-    let g = |s: &mut Sandbox| s.globals().iter().map(bits).collect::<Vec<_>>();
-    assert_eq!(g(s0), g(s1), "{what}: globals");
-    assert_eq!(s0.stdout(), s1.stdout(), "{what}: stdout");
-    assert_eq!(s0.wasi().rng, s1.wasi().rng, "{what}: rng");
-}
-
-/// Applies a deterministic batch of guest operations derived from `seed`.
-fn work(sb: &mut Sandbox, seed: u64) {
-    let pages = (seed % 7 + 1) as i32;
-    let start = (seed * 37 % 1000) as i32;
-    sb.call("put", &[Val::I64(seed as i64 % 50), Val::I64(seed as i64)]).unwrap();
-    sb.call("touch_pages", &[Val::I32(start), Val::I32(pages), Val::I32(seed as i32)]).unwrap();
-    let _ = sb.call_u64("rand", &[]).unwrap();
-    if seed.is_multiple_of(5) {
-        // Grow memory now and then.
-        sb.call("alloc", &[Val::I32(70_000)]).unwrap();
-    }
 }
 
 #[test]
@@ -69,8 +38,8 @@ fn single_level_fork_matches() {
 
 fn single_level(config: &Config) {
     let Pair { rts, roots: [mut a, mut b] } = pair(config);
-    work(&mut a, 1);
-    work(&mut b, 1);
+    work(&mut a, BUF, 1);
+    work(&mut b, BUF, 1);
     let (sa, sb) = (a.snapshot().unwrap(), b.snapshot().unwrap());
     assert_eq!(sb.layers(), 1);
     assert_same(&mut a, &mut b, "parent after snapshot");
@@ -78,13 +47,13 @@ fn single_level(config: &Config) {
         let mut ka = rts[0].spawn_from(&sa, branch).unwrap();
         let mut kb = rts[1].spawn_from(&sb, branch).unwrap();
         assert_same(&mut ka, &mut kb, "fresh child");
-        work(&mut ka, branch + 10);
-        work(&mut kb, branch + 10);
+        work(&mut ka, BUF, branch + 10);
+        work(&mut kb, BUF, branch + 10);
         assert_same(&mut ka, &mut kb, "child after work");
         assert_eq!(ka.call_u64("checksum", &[]).unwrap(), kb.call_u64("checksum", &[]).unwrap());
     }
-    work(&mut a, 99);
-    work(&mut b, 99);
+    work(&mut a, BUF, 99);
+    work(&mut b, BUF, 99);
     assert_same(&mut a, &mut b, "parent continues");
 }
 
@@ -101,9 +70,14 @@ fn depth_64(config: &Config) {
     let Pair { rts, roots: [mut a, mut b] } = pair(config);
     let mut snaps: Vec<[Snapshot; 2]> = Vec::new();
     for depth in 0..64u64 {
-        work(&mut a, depth);
-        work(&mut b, depth);
-        let s = [a.snapshot().unwrap(), b.snapshot().unwrap()];
+        work(&mut a, BUF, depth);
+        work(&mut b, BUF, depth);
+        // Now and then force a compaction regardless of thresholds.
+        let s = if depth % 17 == 16 {
+            [a.snapshot_compacted().unwrap(), b.snapshot_compacted().unwrap()]
+        } else {
+            [a.snapshot().unwrap(), b.snapshot().unwrap()]
+        };
         // Mostly continue in a child, so the chain is a real fork-of-fork;
         // every third level the parent itself continues.
         if depth % 3 != 0 {
@@ -114,7 +88,8 @@ fn depth_64(config: &Config) {
         snaps.push(s);
     }
     assert_eq!(snaps.last().unwrap()[1].depth(), 64);
-    assert_eq!(snaps.last().unwrap()[1].layers(), 64);
+    let max_layers = config.compaction.map_or(usize::MAX, |c| c.max_layers);
+    assert!(snaps.iter().all(|[_, s]| s.layers() <= max_layers));
     // Every intermediate snapshot still spawns the same thing under both.
     for (d, [s0, s1]) in snaps.iter().enumerate().step_by(9) {
         let mut x = rts[0].spawn_from(s0, 1000).unwrap();

@@ -34,7 +34,7 @@ pub struct SandboxStats {
     pub depth: usize,
     /// Layers its memory is composed from (S1).
     pub layers: usize,
-    /// Mapped layer runs (≈ extra VMAs) (S1).
+    /// Layer segments its memory maps over the base image (≈ extra VMAs) (S1).
     pub runs: usize,
 }
 
@@ -111,6 +111,16 @@ impl Sandbox {
     /// snapshot (SPEC §3): with S1 its dirty pages move into a new shared
     /// layer and it gets fresh private copies only when it writes again.
     pub fn snapshot(&mut self) -> Result<Snapshot> {
+        self.snapshot_inner(false)
+    }
+
+    /// Like [`snapshot`](Self::snapshot), but always flattens S1 layers into
+    /// one (see [`Compaction`](crate::Compaction)); same as `snapshot` for S0.
+    pub fn snapshot_compacted(&mut self) -> Result<Snapshot> {
+        self.snapshot_inner(true)
+    }
+
+    fn snapshot_inner(&mut self, force_compact: bool) -> Result<Snapshot> {
         if self.poisoned {
             bail!("cannot snapshot a sandbox that trapped");
         }
@@ -119,7 +129,7 @@ impl Sandbox {
             MemSnap::Copy(_) => MemSnap::Copy(self.mem.read_all()),
             MemSnap::Layered(stack) => {
                 let stack = stack.clone();
-                match self.capture(&stack) {
+                match self.capture(&stack, force_compact) {
                     Ok(snap) => snap,
                     Err(e) => {
                         // A failure after the dirty scan may leave pages
@@ -144,14 +154,39 @@ impl Sandbox {
     }
 
     /// S1: captures the pages dirtied since the last snapshot into a layer on
-    /// top of `stack`.
-    fn capture(&mut self, stack: &LayerStack) -> Result<MemSnap> {
+    /// top of `stack`, or flattens everything into one layer when compaction
+    /// is due.
+    fn capture(&mut self, stack: &LayerStack, force_compact: bool) -> Result<MemSnap> {
         let runs = self.mem.dirty_runs(self.module.0.dirty_tracking)?;
         let size = self.mem.len();
+        let pool = self.module.0.pool.as_deref().expect("S1 modules have a pool");
+        let compaction = self.module.0.compaction;
+        // Compaction is due when the new stack would have too many layers or
+        // need too many mappings per spawn. (Checked before capturing, using
+        // an upper bound for the new layer's segments.)
+        let due = compaction.is_some_and(|c| {
+            stack.layers().len() + usize::from(!runs.is_empty()) > c.max_layers
+                || stack.segments() + runs.len() > c.max_runs
+        });
+        if force_compact || due {
+            // The memory currently holds exactly the snapshot's contents, so
+            // copy every page any layer (or the dirty set) covers from it.
+            let gap = compaction.unwrap_or_default().gap_pages;
+            let covered = stack.covered_runs(&runs, gap);
+            let flat_stack = if covered.is_empty() {
+                stack.base_only(size)
+            } else {
+                let flat = Arc::new(self.mem.capture_layer(covered, pool)?);
+                stack.base_only(size).push(flat, size)
+            };
+            // Re-map ourselves too: drops private pages, the old layers'
+            // mappings (and so their VMAs), and resets write tracking.
+            self.mem.compose(&flat_stack)?;
+            return Ok(MemSnap::Layered(flat_stack));
+        }
         if runs.is_empty() {
             return Ok(MemSnap::Layered(stack.resized(size)));
         }
-        let pool = self.module.0.pool.as_deref().expect("S1 modules have a pool");
         let layer = Arc::new(self.mem.capture_layer(runs, pool)?);
         // Without write-protect tracking, the captured pages would be reported
         // again next time: swap our private copies for the shared layer. With
@@ -176,6 +211,11 @@ impl Sandbox {
         self.mem.read_all()
     }
 
+    /// The whole linear memory, borrowed (no copy).
+    pub fn memory_view(&self) -> &[u8] {
+        self.mem.view()
+    }
+
     /// Writes `data` into linear memory at `offset`.
     pub fn write_memory(&mut self, offset: usize, data: &[u8]) -> Result<()> {
         anyhow::ensure!(
@@ -194,7 +234,7 @@ impl Sandbox {
     pub fn stats(&self) -> SandboxStats {
         let (layers, runs) = match &self.base {
             MemSnap::Copy(_) => (0, 0),
-            MemSnap::Layered(s) => (s.layers().len(), s.runs()),
+            MemSnap::Layered(s) => (s.layers().len(), s.segments()),
         };
         SandboxStats { memory_bytes: self.mem.len(), depth: self.depth, layers, runs }
     }

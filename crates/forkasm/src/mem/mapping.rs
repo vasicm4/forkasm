@@ -60,9 +60,25 @@ impl Mapping {
         // base file is at least `reservation` bytes long, so no page we map
         // lies past its end.
         unsafe { sys::map_file_fixed(self.base, len, stack.base().fd(), 0, true)? };
-        self.pinned().clear();
-        for layer in stack.layers() {
-            self.map_layer(layer)?;
+        let layers = stack.layers();
+        *self.pinned() = layers.to_vec();
+        for seg in stack.plan() {
+            let layer = &layers[seg.layer];
+            let end = seg.run.byte_offset() + seg.run.byte_len();
+            assert!(end <= layer.byte_size() && end <= len);
+            // SAFETY: the segment lies inside our reservation and inside the
+            // layer's storage (checked above; the plan only takes pages from
+            // a layer's own runs), which is never truncated while the layer
+            // lives — and we pin it. The sandbox is quiescent.
+            unsafe {
+                sys::map_file_fixed(
+                    self.base.add(seg.run.byte_offset()),
+                    seg.run.byte_len(),
+                    layer.fd(),
+                    seg.file_off,
+                    true,
+                )?
+            };
         }
         self.accessible.store(len, Ordering::Release);
         self.register_tracking()
@@ -213,7 +229,6 @@ impl MemHandle {
     }
 
     /// Replaces the current contents with `stack` (discarding private pages).
-    #[cfg(test)] // Used by compaction (Week 2).
     pub(crate) fn compose(&self, stack: &LayerStack) -> io::Result<()> {
         self.0.compose(stack, self.len())
     }
@@ -224,10 +239,32 @@ impl MemHandle {
         self.0.map_layer(layer)
     }
 
+    /// The accessible memory, borrowed.
+    ///
+    /// The slice must not outlive the caller's borrow of the owning sandbox:
+    /// `Sandbox` hands it out from `&self`, so no guest code, remap or host
+    /// write (all of which need `&mut Sandbox`) can happen while it lives.
+    pub(crate) fn view(&self) -> &[u8] {
+        // SAFETY: quiescent for the lifetime of the borrow, as documented above.
+        unsafe { self.0.bytes(0, self.len()) }
+    }
+
     /// Copies the accessible memory out.
     pub(crate) fn read_all<B: for<'a> From<&'a [u8]>>(&self) -> B {
         // SAFETY: the sandbox is quiescent (type-level contract above).
         B::from(unsafe { self.0.bytes(0, self.len()) })
+    }
+
+    /// Copies `data` into fresh anonymous memory at offset 0, pre-faulting
+    /// the pages first (S0 spawn).
+    pub(super) fn fill(&self, data: &[u8]) -> io::Result<()> {
+        assert!(data.len() <= self.len());
+        let len = data.len().next_multiple_of(PAGE);
+        // SAFETY: `[base, base + len)` is accessible (`len` ≤ the page-aligned
+        // accessible size) and the sandbox is still being created.
+        unsafe { sys::populate_write(self.0.base, len)? };
+        self.write(0, data);
+        Ok(())
     }
 
     /// Copies `data` into memory at `off`.

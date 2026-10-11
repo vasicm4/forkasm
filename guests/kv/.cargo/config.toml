@@ -1,0 +1,4 @@
+[target.wasm32-wasip1]
+# A 64 KiB shadow stack instead of Rust's default 1 MiB: kv recurses little,
+# and every page of linear memory is copied by the S0 reference strategy.
+rustflags = ["-C", "link-arg=-zstack-size=65536"]

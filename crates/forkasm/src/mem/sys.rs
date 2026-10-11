@@ -131,3 +131,15 @@ impl Drop for SharedMap {
         let _ = unsafe { unmap(self.ptr, self.len) };
     }
 }
+
+/// Faults in `[addr, addr + len)` for writing in one call, which is much
+/// cheaper than taking one page fault per page while copying into it.
+///
+/// # Safety
+/// As for [`map_file_fixed`]; the range must be mapped read-write.
+pub(crate) unsafe fn populate_write(addr: *mut u8, len: usize) -> std::io::Result<()> {
+    // SAFETY: forwarded to the caller's contract; populating does not change
+    // the contents.
+    unsafe { rustix::mm::madvise(addr.cast(), len, rustix::mm::Advice::LinuxPopulateWrite)? };
+    Ok(())
+}

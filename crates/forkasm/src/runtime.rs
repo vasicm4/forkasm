@@ -32,6 +32,9 @@ pub struct Config {
     pub dirty_tracking: DirtyTracking,
     /// Pre-allocated layer storage for S1; `None` allocates on each snapshot.
     pub layer_pool: Option<PoolConfig>,
+    /// When S1 flattens a snapshot's layers into one (`None`: never, except
+    /// through [`Sandbox::snapshot_compacted`](crate::Sandbox::snapshot_compacted)).
+    pub compaction: Option<Compaction>,
     /// Bytes of address space reserved per memory (≥ the largest memory).
     pub memory_reservation: u64,
     /// Unmapped bytes after each reservation, letting Wasmtime elide bounds
@@ -47,10 +50,35 @@ impl Default for Config {
             strategy: Strategy::default(),
             dirty_tracking: DirtyTracking::default(),
             layer_pool: Some(PoolConfig::default()),
+            compaction: Some(Compaction::default()),
             memory_reservation: 1 << 32,
             memory_guard: 32 << 20,
             real_time: false,
         }
+    }
+}
+
+/// Compaction thresholds (SPEC §5.3 step 6).
+///
+/// Every layer run costs a VMA in every sandbox spawned from the snapshot,
+/// and spawn time grows with the number of runs. When a new snapshot would
+/// exceed either limit, its layers are flattened into one: every page any
+/// layer holds is copied into a single new layer, with holes of up to
+/// `gap_pages` filled in so runs merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Compaction {
+    /// Most layers a snapshot may have.
+    pub max_layers: usize,
+    /// Most runs (≈ VMAs per spawned sandbox) a snapshot may have.
+    pub max_runs: usize,
+    /// Holes of at most this many pages between runs are copied too, trading
+    /// copied bytes for fewer VMAs. `usize::MAX` makes one run.
+    pub gap_pages: usize,
+}
+
+impl Default for Compaction {
+    fn default() -> Self {
+        Compaction { max_layers: 64, max_runs: 4096, gap_pages: 16 }
     }
 }
 
@@ -139,6 +167,7 @@ impl Runtime {
             globals: rw.globals,
             has_start: rw.has_start,
             dirty_tracking: self.config.dirty_tracking,
+            compaction: self.config.compaction,
             pool: self.pool.clone(),
         })))
     }
@@ -196,6 +225,7 @@ pub(crate) struct ModuleInner {
     pub(crate) globals: Vec<String>,
     pub(crate) has_start: bool,
     pub(crate) dirty_tracking: DirtyTracking,
+    pub(crate) compaction: Option<Compaction>,
     /// Layer storage (S1 only).
     pub(crate) pool: Option<Arc<LayerPool>>,
 }
