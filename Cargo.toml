@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/forkasm", "crates/forkasm-cli"]
+exclude = ["guests/kv"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vasicm4/forkasm"
+
+[workspace.dependencies]
+forkasm = { path = "crates/forkasm" }
+anyhow = "1"
+thiserror = "2"
+wasmtime = { version = "47.0.4", default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "parallel-compilation", "cache"] }
+rustix = { version = "1.1", features = ["mm", "fs", "process", "param", "pipe"] }
+wasmparser = "=0.252.0"
+wasm-encoder = "=0.252.0"
+wat = "1"
+criterion = "0.8"
+proptest = "1.12"
+libc = "0.2"
+imbl = "7"
+rayon = "1"
