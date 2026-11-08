@@ -28,6 +28,26 @@ Consequences:
 
 ## Decisions and findings
 
+### 2026-11-08 — Final: docs, full benchmark run, compile cache, faster rewrite, crate metadata
+- **The full benchmark suite has been run:** `bench-results/2026-11-08/`, written up in `BENCHMARKS.md` with charts (`scripts/charts.py` → `docs/charts/*.svg`). The whole suite takes ~3 min, not the hours feared.
+  - Headline: S1 default fork 98.9 µs / 161.7 µs, S2 74.2 µs, process fork 627 µs, S0 74.7 ms.
+  - The < 50 µs target is **still missed**. Spawn (~40 µs) is the floor.
+  - Idle-branch memory is < 1 KiB of PSS (8 VMAs; kernel memory not counted), and 1,000 live children work. Those targets are met.
+- **`Config::compile_cache`** (`CompileCache::{Off, UserDefault, Dir}`) turns on Wasmtime's on-disk cache. It is off by default in the library. The CLI uses `UserDefault`, and CPython tests use a cache under `CARGO_TARGET_TMPDIR`.
+- **The rewrite pass is now section-level** (`wasmparser` + `wasm-encoder` 0.252, the versions Wasmtime already builds). walrus is gone.
+  - The code section is copied verbatim and scanned in parallel for table/passive-data instructions. The export section is copied with the new exports appended.
+  - CPython's rewrite: 2.0 s → 45 ms.
+  - With the cache, `Runtime::load` of CPython takes 3.4 s → ~1.0 s cold and ~90 ms cached. Debug `cargo test` takes 8 min → ~1m40s.
+  - Behaviour is unchanged: same globals, image and start handling, and the same rejections. Invalid modules are now caught by Wasmtime's validation at compile time, rather than by walrus's parse.
+- **New clippy** (rustc 1.99): `chunks_exact(32)` → `as_chunks::<32>()` in `mem/uffd.rs`.
+- **Crate prep:**
+  - LICENSE-MIT and LICENSE-APACHE added.
+  - `forkasm` gained `readme`, `keywords`, `categories`, `include` and docs.rs targets, with README and licenses symlinked into the crate.
+  - The name `forkasm` is free on crates.io.
+  - `cargo publish --dry-run` passes. **Not published:** that needs the owner's crates.io token and is irreversible.
+- **SPEC.md §14** lists every adopted deviation in one place.
+- **Wasmtime is still pinned to 47.0.4,** although rustc 1.99 would now allow 48+. Upgrading is a separate change; re-run the suite after it.
+
 ### 2026-10-11 — Week 3: G2 (CPython), branch driver, Baseline B, S2, benchmark suite
 Started early (Week 3 is scheduled for Oct 24–30), with the user's approval. Per the user, the full benchmark suite is **written and smoke-tested but not run**; full runs come later (commands under Benchmarks).
 
@@ -279,7 +299,8 @@ Integration tests and criterion benches live in `crates/forkasm/{tests,benches}`
 | `wasmtime` 47 | The runtime; `cranelift` + `runtime` + `std` only (no WASI crates, SPEC §5.4) |
 | `rustix` | Safe-typed mmap / memfd / mprotect / userfaultfd syscalls for `mem/` |
 | `libc` | `ioctl(PAGEMAP_SCAN)`, which rustix doesn't wrap |
-| `walrus` | Wasm rewrite pass (export mutable globals, strip data segments) |
+| `wasmparser`, `wasm-encoder` (=0.252, Wasmtime's own versions) | Section-level rewrite pass; replaced `walrus` (2026-11-08), which rebuilt every function body |
+| `wasmtime` feature `cache` | On-disk compile cache (`Config::compile_cache`); pulls `zstd` and `toml` |
 | `anyhow`, `thiserror` | Error handling |
 | `wat` (dev) | Inline test modules |
 | `criterion` (dev) | Micro-benchmarks (SPEC §8) |
@@ -289,17 +310,8 @@ Integration tests and criterion benches live in `crates/forkasm/{tests,benches}`
 
 ## Benchmarks
 
-### Full runs still to do (Week 3 suite)
-The suite is built and smoke-tested (`--quick`), but per the user it has **not been run at full size**. To run it:
-
-```
-guests/py/build.sh
-cargo build --release -p forkasm-cli
-target/release/forkasm-cli bench-suite guests/kv/target/wasm32-wasip1/release/kv.wasm \
-    guests/py/out/py.wasm guests/py/out/lib bench-results/<date>
-```
-
-S0 at 1 GiB and the 1,000-child memory test dominate the run time. It needs ~3 GiB free RAM for S0 at 1 GiB.
+### 2026-11-08 — Full suite
+See `BENCHMARKS.md` and `bench-results/2026-11-08/`. The command to rerun it is in `BENCHMARKS.md`.
 
 ### 2026-10-11 — Week 2: compaction trade-off (`forkasm-cli bench-depth … 256`)
 Same machine as below. A fork-of-fork chain of 256 levels on 64.1 MiB of memory. Each level dirties 64 random pages, snapshots, and continues in a new child. Default S1 (write-protect + pool). Median / p99:

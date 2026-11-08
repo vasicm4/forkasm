@@ -1,0 +1,5 @@
+- cpu: AMD Ryzen 7 7735HS with Radeon Graphics (16 threads)
+- kernel: 7.0.0-38-generic
+- wasmtime: 47.0.4
+- forkasm: 0.1.0, release build
+- rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13)

@@ -1,0 +1,4 @@
+strategy,threads,repeats,branches,wall_med_us,wall_p99_us,per_branch,fork_share
+S1,1,10,168,367941.92,373991.37,2.19 ms,1.0% snapshots
+S1,16,10,168,132503.07,136406.86,788.4 µs,3.9% snapshots
+S2,16,10,168,141998.14,144982.64,847.9 µs,1.8% snapshots

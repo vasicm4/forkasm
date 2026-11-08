@@ -6,13 +6,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["wasm", "webassembly", "sandbox", "fork", "snapshot"]
+categories = ["wasm", "virtualization", "os::linux-apis"]
+include = ["src/**/*.rs", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
 wasmtime.workspace = true
 rustix.workspace = true
-walrus.workspace = true
+wasmparser.workspace = true
+wasm-encoder.workspace = true
 libc.workspace = true
 imbl.workspace = true
 rayon.workspace = true

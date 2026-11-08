@@ -312,6 +312,25 @@ security hardening beyond Wasm isolation, capturing mid-call stacks.
 - If a spec assumption turns out wrong, stop, record it in `NOTES.md`, and
   propose the change instead of silently working around it.
 
+## 14. Deviations adopted during implementation
+
+Each was proposed in `NOTES.md` when it came up; this list is the current
+contract. Where it conflicts with an earlier section, this section wins.
+
+| Section | Spec said | Implemented | Why |
+|---|---|---|---|
+| §5.1 | Rewrite exports mutable globals | Also **strips active data segments** into a memory image baked into the base layer once, and **removes `start`** (run only at root spawn, then `_initialize`). Passive data, table mutation, imported memories/tables/mutable globals are rejected | Wasmtime applies data segments and `start` on every instantiation, which would clobber restored memory |
+| §5.1 | `walrus` or `wasm-encoder` | Section-level rewrite with `wasmparser` + `wasm-encoder` (code section copied verbatim) | walrus rebuilt every function: 2 s for CPython vs 45 ms now |
+| §5.3 S1 | Dirty pages via `/proc/self/pagemap` | Default is async **write-protect** tracking (`UFFD_FEATURE_WP_ASYNC` + `PAGEMAP_SCAN`), with `PAGEMAP_SCAN` and raw pagemap as fallbacks; the parent keeps its private pages instead of remapping | Removes the parent remap from the fork path |
+| §5.3 S1 | One sparse memfd per layer | Layers are carved from a **pre-allocated slab pool** and stored packed (file offset ≠ memory offset) | shmem page allocation was ~60% of fork time |
+| §5.3 S1 | Spawn maps every layer oldest-to-newest | Each snapshot computes a **mapping plan** once (non-overlapping segments, newest layer wins) | One `mmap` per segment instead of per run per layer |
+| §5.3 step 6 | Flatten into one layer past a threshold | **Tiered** (LSM-style) compaction with hysteresis; full flatten only as a fallback or via `snapshot_compacted` | Full flattens copied all of memory every few snapshots |
+| §5.3 step 6 | VMA cap 65,530 | Cap on the dev machine is 1,048,576; the VMA test measures per-child VMAs and extrapolates | Exhausting the cap aborts the whole process |
+| §5.5 | Directories hold nodes | Directories map names to **inodes** in a persistent inode table; `imbl` instead of `im` | POSIX semantics for open files across rename/unlink; `im` is unmaintained |
+| §5.6 | `run_parallel` returns `Result` | Returns `Vec<(Sandbox, R)>`; the closure's `R` is usually a `Result` | One failed branch must not fail the batch |
+| §5.2 | — | `Config::compile_cache` (Wasmtime's on-disk cache), off by default | CPython compiles in ~1 s; cached load is ~90 ms |
+| §9 | `benches/`, `tests/` at repo root | `crates/forkasm/{benches,tests}` | Cargo workspace convention |
+
 ## Appendix: session prompts
 
 **Week 1:**

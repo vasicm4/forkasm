@@ -1,0 +1,10 @@
+strategy,iterations,snapshot_med_us,snapshot_p99_us,spawn_med_us,spawn_p99_us,fork_med_us,fork_p99_us
+S0 (full copy),100,48308.68,52383.73,26271.61,28621.59,74742.98,79673.83
+S1 pagemap read,1000,274.45,341.66,32.32,51.81,307.98,385.41
+S1 PAGEMAP_SCAN,1000,221.20,287.33,32.77,49.75,255.16,330.72
+S1 scan + pool,1000,93.28,172.24,33.03,84.57,127.45,256.00
+S1 write-protect,1000,196.83,286.53,40.11,72.83,237.31,341.86
+S1 write-protect + pool (default),1000,57.97,106.66,40.36,78.05,98.95,161.69
+S2 lazy (userfaultfd) + pool,1000,59.37,123.50,14.13,36.50,74.20,145.26
+process fork() (child ready),200,–,–,–,–,627.03,1184.69
+process fork() + 1-page write; reply,200,–,–,–,–,727.36,1290.29
