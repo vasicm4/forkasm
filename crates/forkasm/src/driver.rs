@@ -34,8 +34,11 @@ pub struct Branch {
 
 /// A node kept at the end of the search.
 pub struct Survivor {
+    /// The live sandbox, ready to continue or snapshot again.
     pub sandbox: Sandbox,
+    /// The score its last step returned.
     pub score: f64,
+    /// Child indices from the root to this node.
     pub path: Vec<usize>,
 }
 
@@ -52,9 +55,11 @@ pub struct LevelStats {
     pub snapshot: Duration,
 }
 
+/// The result of a [`search`].
 pub struct Outcome {
     /// The best `keep` nodes of the last level, best first.
     pub best: Vec<Survivor>,
+    /// Numbers for each level, root first.
     pub levels: Vec<LevelStats>,
 }
 

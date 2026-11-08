@@ -12,6 +12,12 @@ use crate::runtime::GuestModule;
 use crate::snapshot::{MemSnap, Snapshot, SnapshotInner};
 use crate::wasi::WasiState;
 
+/// A live guest instance: its store, memory, globals and WASI state.
+///
+/// Drive it with [`call`](Self::call); between calls, capture it with
+/// [`snapshot`](Self::snapshot) and spawn children from the snapshot.
+/// Dropping a sandbox frees its private pages. A sandbox whose call trapped is
+/// *poisoned*: it can no longer be called or snapshotted.
 pub struct Sandbox {
     store: Store<WasiState>,
     instance: Instance,
@@ -30,6 +36,7 @@ pub struct Sandbox {
 /// Point-in-time numbers for tests and benchmarks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxStats {
+    /// Current size of the linear memory.
     pub memory_bytes: usize,
     /// Snapshots between this sandbox and its root.
     pub depth: usize,
@@ -298,6 +305,7 @@ impl Sandbox {
         Ok(crate::mem::fork_run(|| self.call_u64(name, args).unwrap_or(u64::MAX))?)
     }
 
+    /// Current size, depth, layering and filesystem numbers.
     pub fn stats(&self) -> SandboxStats {
         let (layers, runs) = match &self.base {
             MemSnap::Copy(_) => (0, 0),

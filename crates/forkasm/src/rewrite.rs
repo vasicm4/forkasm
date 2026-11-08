@@ -34,10 +34,13 @@ const CODE_SECTION: u8 = 10;
 const DATA_SECTION: u8 = 11;
 const DATA_COUNT_SECTION: u8 = 12;
 
+/// Why a module could not be rewritten.
 #[derive(Debug, thiserror::Error)]
 pub enum RewriteError {
+    /// The module is not valid WebAssembly.
     #[error("invalid module: {0}")]
     Parse(String),
+    /// The module is valid but uses a feature forkasm cannot snapshot.
     #[error("unsupported module: {0}")]
     Unsupported(String),
 }
@@ -64,7 +67,9 @@ pub struct MemImage {
 /// A rewritten module and what the host needs to know about it.
 #[derive(Debug)]
 pub struct Rewritten {
+    /// The rewritten module.
     pub wasm: Vec<u8>,
+    /// The memory contents its data segments described.
     pub image: MemImage,
     /// Export names of the mutable globals, in global-index order.
     pub globals: Vec<String>,

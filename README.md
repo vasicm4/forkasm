@@ -1,5 +1,7 @@
 # forkasm
 
+[![CI](https://github.com/vasicm4/forkasm/actions/workflows/ci.yml/badge.svg)](https://github.com/vasicm4/forkasm/actions/workflows/ci.yml)
+
 Fork a **running** WebAssembly sandbox — its memory, WASI state and
 filesystem — in about a tenth of a millisecond, many ways and many levels
 deep, so an AI agent can branch mid-task, explore alternatives in parallel,

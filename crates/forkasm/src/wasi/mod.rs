@@ -48,7 +48,10 @@ pub struct Exit(pub i32);
 /// Virtual time: every clock read advances it by `tick_ns`.
 #[derive(Clone, Debug)]
 pub struct Clock {
+    /// Virtual time elapsed so far, in ns. Realtime reads add it to
+    /// 2026-01-01T00:00:00Z.
     pub now_ns: u64,
+    /// How far each clock read advances `now_ns`.
     pub tick_ns: u64,
     /// Read the host clock instead (non-deterministic, opt-in).
     pub real: bool,
@@ -91,14 +94,23 @@ impl Clock {
 /// Everything a guest can observe through WASI. Cloned on fork.
 #[derive(Clone, Debug, Default)]
 pub struct WasiState {
+    /// Command-line arguments.
     pub args: Arc<[String]>,
+    /// Environment variables.
     pub env: Arc<[(String, String)]>,
+    /// The clock behind `clock_time_get`.
     pub clock: Clock,
+    /// The random stream behind `random_get`.
     pub rng: Rng,
+    /// Everything written to fd 1.
     pub stdout: Output,
+    /// Everything written to fd 2.
     pub stderr: Output,
+    /// The code passed to `proc_exit`, once the guest has called it.
     pub exit: Option<i32>,
+    /// The filesystem.
     pub vfs: Vfs,
+    /// Open file descriptors.
     pub fds: FdTable,
 }
 

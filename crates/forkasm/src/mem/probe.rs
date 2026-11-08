@@ -13,8 +13,11 @@ use super::{PAGE, Run, sys};
 
 /// Outcome of one probe.
 pub struct Probe {
+    /// What was checked.
     pub name: &'static str,
+    /// Whether the kernel behaved as needed.
     pub ok: bool,
+    /// Measured values or the error.
     pub detail: String,
 }
 

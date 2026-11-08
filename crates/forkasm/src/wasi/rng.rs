@@ -19,6 +19,7 @@ fn splitmix64(x: &mut u64) -> u64 {
 }
 
 impl Rng {
+    /// A stream seeded with `seed`.
     pub fn new(seed: u64) -> Rng {
         let mut x = seed;
         Rng([splitmix64(&mut x), splitmix64(&mut x), splitmix64(&mut x), splitmix64(&mut x)])
@@ -30,6 +31,7 @@ impl Rng {
         Rng::new(splitmix64(&mut x))
     }
 
+    /// The next 64 random bits.
     pub fn next_u64(&mut self) -> u64 {
         let s = &mut self.0;
         let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
@@ -43,6 +45,7 @@ impl Rng {
         result
     }
 
+    /// Fills `buf` with random bytes.
     pub fn fill(&mut self, buf: &mut [u8]) {
         for chunk in buf.chunks_mut(8) {
             let v = self.next_u64().to_le_bytes();

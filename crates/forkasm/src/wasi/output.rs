@@ -16,6 +16,7 @@ pub struct Output {
 }
 
 impl Output {
+    /// Appends `data`.
     pub fn append(&mut self, data: &[u8]) {
         self.tail.extend_from_slice(data);
         self.len += data.len();
@@ -24,10 +25,12 @@ impl Output {
         }
     }
 
+    /// Bytes written so far.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Whether nothing has been written.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

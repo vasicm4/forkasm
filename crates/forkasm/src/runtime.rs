@@ -29,8 +29,12 @@ pub enum Strategy {
     Lazy,
 }
 
+/// Settings for a [`Runtime`]. The defaults suit most uses: S1 with the
+/// best dirty-page tracking the kernel supports, a pre-allocated layer pool,
+/// tiered compaction, and 4 GiB of address space per memory.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// How memory is snapshotted and forked.
     pub strategy: Strategy,
     /// How S1 finds dirty pages; `Auto` picks the best the kernel supports.
     pub dirty_tracking: DirtyTracking,
@@ -56,6 +60,7 @@ pub struct Config {
 /// engine settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum CompileCache {
+    /// Compile every module from scratch.
     #[default]
     Off,
     /// Wasmtime's default location (`$XDG_CACHE_HOME/wasmtime` or
@@ -104,6 +109,9 @@ impl Default for Compaction {
     }
 }
 
+/// The entry point: a Wasmtime engine set up for forkable memories, plus
+/// the shared layer pool. Loads modules and spawns sandboxes. One runtime
+/// per process is usually enough.
 pub struct Runtime {
     engine: Engine,
     config: Config,
@@ -111,6 +119,11 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Creates a runtime.
+    ///
+    /// Fails if `config` asks for write-protect tracking (or S2, which needs
+    /// it) and the kernel doesn't support it, or if the memory reservation or
+    /// guard is not a multiple of the page size.
     pub fn new(mut config: Config) -> Result<Runtime> {
         if config.strategy == Strategy::Lazy {
             config.dirty_tracking = DirtyTracking::WriteProtect;
@@ -178,6 +191,8 @@ impl Runtime {
         Ok(())
     }
 
+    /// Reads, rewrites and compiles the module at `path`; see
+    /// [`load_bytes`](Self::load_bytes).
     pub fn load(&self, path: impl AsRef<Path>) -> Result<GuestModule> {
         let path = path.as_ref();
         let wasm = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -185,6 +200,10 @@ impl Runtime {
     }
 
     /// Rewrites (SPEC §5.1) and compiles a module.
+    ///
+    /// Fails if the module is invalid, breaks the restrictions listed in
+    /// [`rewrite`](crate::rewrite), or imports anything other than
+    /// `wasi_snapshot_preview1`.
     pub fn load_bytes(&self, wasm: &[u8]) -> Result<GuestModule> {
         let rw = rewrite::rewrite(wasm)?;
         let module = Module::new(&self.engine, &rw.wasm)?;
@@ -247,7 +266,10 @@ impl Runtime {
 /// Options for a root sandbox.
 #[derive(Clone, Debug, Default)]
 pub struct SpawnOpts {
+    /// Command-line arguments the guest sees (`args_get`); by convention the
+    /// program name comes first.
     pub args: Vec<String>,
+    /// Environment variables the guest sees (`environ_get`).
     pub env: Vec<(String, String)>,
     /// RNG seed of the root.
     pub seed: u64,

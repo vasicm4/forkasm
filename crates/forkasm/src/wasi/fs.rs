@@ -21,6 +21,7 @@ pub(crate) enum Entry {
     File { ino: Ino, offset: u64, append: bool, read: bool, write: bool },
 }
 
+/// A sandbox's open file descriptors.
 #[derive(Clone, Debug)]
 pub struct FdTable {
     entries: BTreeMap<u32, Entry>,
@@ -72,6 +73,7 @@ impl FdTable {
         self.entries.len()
     }
 
+    /// Whether no fd is open (never true while stdio is open).
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

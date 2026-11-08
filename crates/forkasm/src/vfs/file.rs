@@ -15,10 +15,12 @@ pub struct FileData {
 }
 
 impl FileData {
+    /// Size in bytes.
     pub fn len(&self) -> u64 {
         self.len
     }
 
+    /// Whether the file has no bytes.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -61,6 +63,8 @@ impl FileData {
         self.len = self.len.max(end as u64);
     }
 
+    /// Sets the size to `len`, dropping bytes past it or extending with a
+    /// hole (zeros).
     pub fn truncate(&mut self, len: u64) {
         if len < self.len {
             let len_usize = len as usize;

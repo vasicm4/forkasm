@@ -30,15 +30,19 @@ pub const PAGE: usize = 4096;
 /// A run of contiguous pages: `[page, page + len)`, both in host pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
+    /// First page.
     pub page: usize,
+    /// Number of pages.
     pub len: usize,
 }
 
 impl Run {
+    /// Offset of the first page in bytes.
     pub fn byte_offset(&self) -> usize {
         self.page * PAGE
     }
 
+    /// Length in bytes.
     pub fn byte_len(&self) -> usize {
         self.len * PAGE
     }

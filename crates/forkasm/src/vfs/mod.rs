@@ -19,6 +19,7 @@ use imbl::OrdMap;
 
 pub use file::{CHUNK, FileData};
 
+/// An inode number.
 pub type Ino = u64;
 
 /// The root directory's inode.
@@ -27,34 +28,48 @@ pub const ROOT: Ino = 1;
 /// Filesystem errors, named after the WASI errnos they map to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FsError {
+    /// `ENOENT`.
     #[error("no such file or directory")]
     NoEnt,
+    /// `EEXIST`.
     #[error("file exists")]
     Exist,
+    /// `ENOTDIR`.
     #[error("not a directory")]
     NotDir,
+    /// `EISDIR`.
     #[error("is a directory")]
     IsDir,
+    /// `ENOTEMPTY`.
     #[error("directory not empty")]
     NotEmpty,
+    /// `EROFS`: the target is part of a read-only host mount.
     #[error("read-only file system")]
     ReadOnly,
+    /// `EINVAL`.
     #[error("invalid argument")]
     Inval,
+    /// `ENOTCAPABLE`: a path tried to leave its directory through `..`.
     #[error("path escapes its directory")]
     NotCapable,
 }
 
+/// Result of a filesystem operation.
 pub type FsResult<T> = Result<T, FsError>;
 
+/// What an inode is.
 #[derive(Clone, Debug)]
 pub enum Kind {
+    /// A regular file and its contents.
     File(Arc<FileData>),
+    /// A directory: entry names to inode numbers.
     Dir(OrdMap<String, Ino>),
 }
 
+/// A file or directory.
 #[derive(Clone, Debug)]
 pub struct Inode {
+    /// File or directory, with its contents.
     pub kind: Kind,
     /// Directory entries naming this inode (0 once unlinked).
     pub nlink: u64,
@@ -65,10 +80,12 @@ pub struct Inode {
 }
 
 impl Inode {
+    /// Whether this is a directory.
     pub fn is_dir(&self) -> bool {
         matches!(self.kind, Kind::Dir(_))
     }
 
+    /// File size in bytes, or a directory's number of entries.
     pub fn size(&self) -> u64 {
         match &self.kind {
             Kind::File(f) => f.len(),
@@ -77,6 +94,12 @@ impl Inode {
     }
 }
 
+/// A sandbox's filesystem. Clone it to fork it: O(1), with later changes
+/// on either side copying only what they touch.
+///
+/// Paths are `/`-separated; methods taking a `dir` resolve names relative to
+/// that directory inode. `now` arguments are modification times in ns since
+/// the Unix epoch.
 #[derive(Clone, Debug)]
 pub struct Vfs {
     inodes: OrdMap<Ino, Inode>,
@@ -91,6 +114,7 @@ impl Default for Vfs {
 }
 
 impl Vfs {
+    /// The inode numbered `ino`.
     pub fn inode(&self, ino: Ino) -> FsResult<&Inode> {
         self.inodes.get(&ino).ok_or(FsError::NoEnt)
     }
@@ -154,6 +178,7 @@ impl Vfs {
         }
     }
 
+    /// The inode of entry `name` in directory `dir`, if there is one.
     pub fn lookup(&self, dir: Ino, name: &str) -> FsResult<Option<Ino>> {
         Ok(self.entries(dir)?.get(name).copied())
     }
@@ -187,10 +212,12 @@ impl Vfs {
         Ok(ino)
     }
 
+    /// Creates an empty file `name` in `dir`; fails if `name` exists.
     pub fn create_file(&mut self, dir: Ino, name: &str, now: u64) -> FsResult<Ino> {
         self.link(dir, name, Kind::File(Arc::default()), now)
     }
 
+    /// Creates an empty directory `name` in `dir`; fails if `name` exists.
     pub fn create_dir(&mut self, dir: Ino, name: &str, now: u64) -> FsResult<Ino> {
         self.link(dir, name, Kind::Dir(OrdMap::new()), now)
     }
@@ -274,6 +301,8 @@ impl Vfs {
         Ok(false)
     }
 
+    /// Reads file `ino` from `offset` into `buf`; returns the bytes read (0
+    /// at EOF).
     pub fn read(&self, ino: Ino, offset: u64, buf: &mut [u8]) -> FsResult<usize> {
         match &self.inode(ino)?.kind {
             Kind::File(f) => Ok(f.read(offset, buf)),
@@ -293,11 +322,13 @@ impl Vfs {
         }
     }
 
+    /// Writes `data` into file `ino` at `offset`, growing it if needed.
     pub fn write(&mut self, ino: Ino, offset: u64, data: &[u8], now: u64) -> FsResult<()> {
         self.file_mut(ino, now)?.write(offset, data);
         Ok(())
     }
 
+    /// Sets the size of file `ino` to `len`.
     pub fn truncate(&mut self, ino: Ino, len: u64, now: u64) -> FsResult<()> {
         self.file_mut(ino, now)?.truncate(len);
         Ok(())
