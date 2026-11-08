@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt, clippy, docs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc -p forkasm --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            guests/kv -> target
+      # wasi-sdk 20 and the prebuilt libpython used by guests/py/build.sh.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/forkasm-toolchain
+          key: forkasm-toolchain-${{ hashFiles('guests/py/build.sh') }}
+      # Logs which kernel features the runner has. Tests of the userfaultfd
+      # write-protect path (and S2) are skipped when it is unavailable.
+      - name: Kernel features
+        run: scripts/envcheck.sh
+      - name: Build the CPython guest
+        run: guests/py/build.sh
+      - run: cargo test --workspace --release --locked
+
+  msrv:
+    name: MSRV (1.94)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
