@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use forkasm::mem::DirtyTracking;
-use forkasm::{Compaction, Config, Runtime, Sandbox, Strategy, Val};
+use forkasm::{Compaction, CompileCache, Config, Runtime, Sandbox, Strategy, Val};
 
 /// Builds `guests/kv` for `wasm32-wasip1` (once per process) and returns the
 /// module path.
@@ -31,6 +31,18 @@ pub fn kv_wasm() -> &'static Path {
 
 pub fn runtime(strategy: Strategy) -> Runtime {
     Runtime::new(Config { strategy, ..Config::default() }).unwrap()
+}
+
+/// `config` with compiled modules cached under the target directory, so the
+/// 19 MB CPython module compiles once across test binaries and runs.
+pub fn cached(config: Config) -> Config {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("compile-cache");
+    Config { compile_cache: CompileCache::Dir(dir), ..config }
+}
+
+/// A runtime for CPython tests (compile cache on).
+pub fn py_runtime(strategy: Strategy) -> Runtime {
+    Runtime::new(cached(Config { strategy, ..Config::default() })).unwrap()
 }
 
 /// S0, S1, and S2 when the kernel supports it.

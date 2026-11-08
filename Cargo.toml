@@ -13,9 +13,10 @@ repository = "https://github.com/vasicm4/forkasm"
 forkasm = { path = "crates/forkasm" }
 anyhow = "1"
 thiserror = "2"
-wasmtime = { version = "47.0.4", default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "parallel-compilation"] }
+wasmtime = { version = "47.0.4", default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "parallel-compilation", "cache"] }
 rustix = { version = "1.1", features = ["mm", "fs", "process", "param", "pipe"] }
-walrus = "0.27"
+wasmparser = "=0.252.0"
+wasm-encoder = "=0.252.0"
 wat = "1"
 criterion = "0.8"
 proptest = "1.12"

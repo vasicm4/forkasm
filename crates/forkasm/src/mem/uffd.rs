@@ -142,7 +142,7 @@ pub(super) fn next_faults(out: &mut Vec<usize>) -> io::Result<()> {
     }
     // `struct uffd_msg` is 32 packed bytes: the event, then for a page fault
     // `flags` at 8 and `address` at 16.
-    for msg in msgs[..n as usize].chunks_exact(32) {
+    for msg in msgs[..n as usize].as_chunks::<32>().0 {
         if msg[0] == UFFD_EVENT_PAGEFAULT {
             let addr = u64::from_ne_bytes(msg[16..24].try_into().unwrap()) as usize;
             out.push(addr & !(super::PAGE - 1));

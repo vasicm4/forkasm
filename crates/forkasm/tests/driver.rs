@@ -111,7 +111,7 @@ fn search_with_all_branches_failing_ends_early() {
 /// the target.
 #[test]
 fn python_beam_search_finds_target() {
-    let rt = runtime(Strategy::Layered);
+    let rt = common::py_runtime(Strategy::Layered);
     let mut root = py_root(&rt);
     forkasm::python::exec(&mut root, "x = 0").unwrap();
     let snap = root.snapshot().unwrap();

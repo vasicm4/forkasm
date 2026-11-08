@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{assert_same, layered_configs, py_root, runtime, strategies};
+use common::{assert_same, cached, layered_configs, py_root, py_runtime, strategies};
 use forkasm::python::{exec, get_int};
 use forkasm::{Config, Runtime, Strategy};
 
@@ -14,7 +14,7 @@ fn out(sb: &forkasm::Sandbox) -> String {
 #[test]
 fn forks_between_statements() {
     for strategy in strategies() {
-        let rt = runtime(strategy);
+        let rt = py_runtime(strategy);
         let mut root = py_root(&rt);
         exec(&mut root, "x = 41\nprint('hello', x)").unwrap();
         assert_eq!(out(&root), "hello 41\n");
@@ -33,7 +33,7 @@ fn forks_between_statements() {
 
 #[test]
 fn exceptions_are_reported_and_the_interpreter_continues() {
-    let rt = runtime(Strategy::Layered);
+    let rt = py_runtime(Strategy::Layered);
     let mut root = py_root(&rt);
     let err = exec(&mut root, "1 / 0").unwrap_err().to_string();
     assert!(err.contains("ZeroDivisionError"), "{err}");
@@ -46,7 +46,7 @@ fn exceptions_are_reported_and_the_interpreter_continues() {
 #[test]
 fn stdlib_imports_and_files() {
     for strategy in strategies() {
-        let rt = runtime(strategy);
+        let rt = py_runtime(strategy);
         let mut root = py_root(&rt);
         exec(
             &mut root,
@@ -75,7 +75,7 @@ fn stdlib_imports_and_files() {
 
 #[test]
 fn branches_replay_deterministically() {
-    let rt = runtime(Strategy::Layered);
+    let rt = py_runtime(Strategy::Layered);
     let mut root = py_root(&rt);
     exec(&mut root, "import os, random, time").unwrap();
     let snap = root.snapshot().unwrap();
@@ -118,7 +118,7 @@ fn matches_s0() {
     ];
     let mut configs = vec![Config { strategy: Strategy::Copy, ..Config::default() }];
     configs.extend(layered_configs());
-    let runtimes: Vec<Runtime> = configs.into_iter().map(|c| Runtime::new(c).unwrap()).collect();
+    let runtimes: Vec<Runtime> = configs.into_iter().map(|c| Runtime::new(cached(c)).unwrap()).collect();
     let mut sbs: Vec<_> = runtimes.iter().map(py_root).collect();
     for (i, stmt) in program.iter().enumerate() {
         for (sb, rt) in sbs.iter_mut().zip(&runtimes) {

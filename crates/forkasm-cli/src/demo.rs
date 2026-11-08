@@ -8,7 +8,9 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use forkasm::{Config, Runtime, python};
+use forkasm::{Runtime, python};
+
+use crate::suite;
 
 use crate::suite::fmt;
 
@@ -44,7 +46,7 @@ const APPROACHES: [(&str, &str); 8] = [
 ];
 
 pub fn run(wasm: &str, lib: &str) -> Result<()> {
-    let rt = Runtime::new(Config::default())?;
+    let rt = Runtime::new(suite::base_config())?;
     let t = Instant::now();
     let module = rt.load(wasm)?;
     println!("loaded CPython guest in {}", fmt(t.elapsed()));

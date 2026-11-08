@@ -46,6 +46,23 @@ pub struct Config {
     pub memory_guard: u64,
     /// Give guests the host clock instead of the deterministic virtual one.
     pub real_time: bool,
+    /// Where compiled modules are cached across processes (Wasmtime's
+    /// on-disk cache). Off by default; CPython's 19 MB module takes seconds to
+    /// compile, so tools that load it repeatedly should turn this on.
+    pub compile_cache: CompileCache,
+}
+
+/// Wasmtime's on-disk cache of compiled modules, keyed by module bytes and
+/// engine settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CompileCache {
+    #[default]
+    Off,
+    /// Wasmtime's default location (`$XDG_CACHE_HOME/wasmtime` or
+    /// `~/.cache/wasmtime` on Linux).
+    UserDefault,
+    /// This directory (made absolute if relative).
+    Dir(std::path::PathBuf),
 }
 
 impl Default for Config {
@@ -58,6 +75,7 @@ impl Default for Config {
             memory_reservation: 1 << 32,
             memory_guard: 32 << 20,
             real_time: false,
+            compile_cache: CompileCache::Off,
         }
     }
 }
@@ -116,6 +134,18 @@ impl Runtime {
             .memory_reservation_for_growth(0)
             .wasm_multi_memory(false)
             .wasm_memory64(false);
+        match &config.compile_cache {
+            CompileCache::Off => {}
+            CompileCache::UserDefault => {
+                wt.cache(Some(wasmtime::Cache::new(wasmtime::CacheConfig::new())?));
+            }
+            CompileCache::Dir(dir) => {
+                let dir = std::path::absolute(dir)?;
+                let mut cc = wasmtime::CacheConfig::new();
+                cc.with_directory(dir);
+                wt.cache(Some(wasmtime::Cache::new(cc)?));
+            }
+        }
         let pool = match (config.strategy, config.layer_pool) {
             (Strategy::Layered | Strategy::Lazy, Some(pool)) => Some(pool),
             // A pool with nothing ready: every slab is allocated on demand.

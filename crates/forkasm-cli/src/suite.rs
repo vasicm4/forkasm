@@ -278,12 +278,18 @@ pub fn fmt(d: Duration) -> String {
 
 // ---------------------------------------------------------------- kv setup
 
+/// The default configuration, with compiled modules cached in Wasmtime's
+/// user cache directory (CPython takes seconds to compile).
+pub fn base_config() -> Config {
+    Config { compile_cache: forkasm::CompileCache::UserDefault, ..Config::default() }
+}
+
 fn kv_runtime(
     strategy: Strategy,
     dirty_tracking: DirtyTracking,
     layer_pool: Option<PoolConfig>,
 ) -> Result<Runtime> {
-    Runtime::new(Config { strategy, dirty_tracking, layer_pool, ..Config::default() })
+    Runtime::new(Config { strategy, dirty_tracking, layer_pool, ..base_config() })
 }
 
 /// A clean snapshot of a kv guest with `buf_pages` buffer pages, all touched,
@@ -429,7 +435,7 @@ pub fn size(kv: &str, scale: Scale) -> Result<Table> {
         let n0 = scale.iters((6400 / mib).clamp(5, 100));
         let [_, _, s0_fork] = fork_samples(&s0, &base, pages, dirty, n0)?;
         drop((base, s0));
-        let s1 = Runtime::new(Config::default())?;
+        let s1 = Runtime::new(base_config())?;
         let base = kv_base(&s1, kv, pages)?;
         let [snap, spawn, fork] = fork_samples(&s1, &base, pages, dirty, scale.iters(500))?;
         let [ready, _] = process_fork_samples(&s1, &base, scale.iters(100))?;
@@ -457,7 +463,7 @@ pub fn dirty(kv: &str, scale: Scale) -> Result<Table> {
     );
     let s0 = kv_runtime(Strategy::Copy, DirtyTracking::Auto, None)?;
     let s0_base = kv_base(&s0, kv, pages)?;
-    let s1 = Runtime::new(Config::default())?;
+    let s1 = Runtime::new(base_config())?;
     let s1_base = kv_base(&s1, kv, pages)?;
     let mut counts = vec![1, pages / 1000, pages / 100, pages / 10, pages / 2, pages];
     counts.retain(|&n| n > 0);
@@ -552,7 +558,7 @@ pub fn depth(kv: &str, steps: usize) -> Result<Table> {
         ("default (layers<=32, maps<=512, gap 16)", Some(Compaction::default())),
     ];
     for (name, compaction) in settings {
-        let rt = Runtime::new(Config { compaction, ..Config::default() })?;
+        let rt = Runtime::new(Config { compaction, ..base_config() })?;
         let base = kv_base(&rt, kv, pages)?;
         let mut sb = rt.spawn_from(&base, 0)?;
         let [mut snap_t, mut spawn_t] = <[Samples; 2]>::default();
@@ -614,7 +620,7 @@ pub fn python_tree(guests: &Guests, scale: Scale) -> Result<Table> {
     let runs =
         [("S1", Strategy::Layered, 1), ("S1", Strategy::Layered, threads), ("S2", Strategy::Lazy, threads)];
     for (name, strategy, n) in runs {
-        let rt = Runtime::new(Config { strategy, ..Config::default() })?;
+        let rt = Runtime::new(Config { strategy, ..base_config() })?;
         let module = rt.load(guests.py)?;
         let mut root = python::spawn(&rt, &module, guests.py_lib)?;
         python::exec(&mut root, "import random\nstate = []")?;
@@ -665,10 +671,8 @@ pub fn lazy(kv: &str, scale: Scale) -> Result<Table> {
         ),
         &["child writes", "S1 fork", "S1 fork + writes", "S2 fork", "S2 fork + writes"],
     );
-    let rts = [
-        Runtime::new(Config::default())?,
-        Runtime::new(Config { strategy: Strategy::Lazy, ..Config::default() })?,
-    ];
+    let rts =
+        [Runtime::new(base_config())?, Runtime::new(Config { strategy: Strategy::Lazy, ..base_config() })?];
     let bases = rts.iter().map(|rt| kv_base(rt, kv, pages)).collect::<Result<Vec<_>>>()?;
     let mut counts = vec![0, 16, pages / 100, pages / 10, pages];
     counts.sort();

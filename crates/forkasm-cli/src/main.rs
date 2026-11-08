@@ -64,7 +64,7 @@ fn inspect(path: &str) -> Result<()> {
 /// between statements, under the default S1 configuration.
 fn py_profile(wasm: &str, lib: &str, iters: usize) -> Result<()> {
     use forkasm::python;
-    let rt = Runtime::new(Config::default())?;
+    let rt = Runtime::new(suite::base_config())?;
     let t = Instant::now();
     let module = rt.load(wasm)?;
     println!("load + compile: {}", fmt(t.elapsed()));
@@ -147,7 +147,7 @@ fn py_profile(wasm: &str, lib: &str, iters: usize) -> Result<()> {
         ("maps<=32", Some(Compaction { max_runs: 32, ..Compaction::default() })),
     ];
     for (name, compaction) in settings {
-        let rt = Runtime::new(Config { compaction, ..Config::default() })?;
+        let rt = Runtime::new(Config { compaction, ..suite::base_config() })?;
         let module = rt.load(wasm)?;
         let mut sb = python::spawn(&rt, &module, lib)?;
         python::exec(&mut sb, "import json, collections\nx = 0\nlog = []\nd = {}")?;

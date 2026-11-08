@@ -19,7 +19,7 @@ mod snapshot;
 pub mod vfs;
 pub mod wasi;
 
-pub use runtime::{Compaction, Config, GuestModule, Runtime, SpawnOpts, Strategy};
+pub use runtime::{Compaction, CompileCache, Config, GuestModule, Runtime, SpawnOpts, Strategy};
 pub use sandbox::{Sandbox, SandboxStats};
 pub use snapshot::Snapshot;
 pub use wasmtime::Val;
